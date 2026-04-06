@@ -3,6 +3,14 @@
 *.so
 *.gguf
 *.bin
+
+# UMA research files
+UMA_METAL_CHANGES.md
+UMA_RESEARCH_FINDINGS.md
+
+# Benchmark output files
+baseline_*.txt
+post_fix_*.txt
 *.exe
 *.dll
 *.log
