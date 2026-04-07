@@ -3229,6 +3229,7 @@ kernel void kernel_axpy_f16(
         constant   uint64_t & nb01       [[buffer(7)]],   // byte stride per row in src0
         constant   float    & threshold  [[buffer(8)]],   // sparsity threshold
         constant   int      & has_gpu_idx [[buffer(9)]],  // whether gpu_idx buffer is valid
+        constant   int      & accumulate [[buffer(10)]],  // 0=overwrite, 1=accumulate (dst += sum)
         uint tgpig [[threadgroup_position_in_grid]],
         uint tiisg [[thread_index_in_simdgroup]]) {
 
@@ -3239,22 +3240,24 @@ kernel void kernel_axpy_f16(
     float sum = 0.0f;
 
     for (int row = 0; row < ne01; row++) {
-        // Skip zero activations (common in ReLU-activated models)
         if (src1[row] == 0.0f) continue;
-
-        // Skip rows below sparsity threshold (predicted inactive neurons)
         if (sparse_idx[row] < threshold) continue;
-
-        // UMA mode: when has_gpu_idx==0, process all active rows (no CPU/GPU split).
-        // When has_gpu_idx==1, Metal handles gpu_idx==1 rows (GPU-assigned neurons).
         if (has_gpu_idx && gpu_idx[row] == 0) continue;
 
+        // Quantize activation to f16 to match CPU AXPY behavior
+        // (CPU converts src1 to f16 in INIT phase before computation)
+        half act_f16 = (half)src1[row];
+        float act = (float)act_f16;
+
         device const half * src0_row = (device const half *)((device const char *)src0 + row * nb01);
-        sum += src1[row] * (float)src0_row[col];
+        sum += act * (float)src0_row[col];
     }
 
-    // Write result (not accumulate — Metal doesn't have CPU's INIT zero phase)
-    dst[col] = sum;
+    if (accumulate) {
+        dst[col] += sum;
+    } else {
+        dst[col] = sum;
+    }
 }
 
 // Q4_0 quantized weight variant
@@ -3270,6 +3273,7 @@ kernel void kernel_axpy_q4_0(
         constant   uint64_t & nb01       [[buffer(7)]],   // byte stride per row
         constant   float    & threshold  [[buffer(8)]],   // sparsity threshold
         constant   int      & has_gpu_idx [[buffer(9)]],  // whether gpu_idx is valid
+        constant   int      & accumulate [[buffer(10)]],  // 0=overwrite, 1=accumulate
         uint tgpig [[threadgroup_position_in_grid]],
         uint tiisg [[thread_index_in_simdgroup]]) {
 
@@ -3303,6 +3307,9 @@ kernel void kernel_axpy_q4_0(
         sum += src1[row] * weight;
     }
 
-    // Write result (not accumulate — Metal doesn't have CPU's INIT zero phase)
-    dst[col] = sum;
+    if (accumulate) {
+        dst[col] += sum;
+    } else {
+        dst[col] = sum;
+    }
 }

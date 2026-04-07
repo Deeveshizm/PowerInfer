@@ -14313,6 +14313,10 @@ static void ggml_axpy_avx_f16(const int n, const ggml_fp16_t * restrict vx, cons
     (void)vy;
 }
 
+// [UMA-FIX] When false, CPU AXPY processes ALL neurons (hot + cold).
+// When true (default), CPU skips hot neurons (gpu_idx==1) for parallel mode.
+bool ggml_axpy_skip_gpu_idx = true;
+
 static void ggml_compute_forward_mul_mat_axpy(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
@@ -14414,21 +14418,19 @@ static void ggml_compute_forward_mul_mat_axpy(
         src1_ptr = (ggml_fp16_t *)((char *)wdata + col_idx * row_size);
         sparse_idx = (float *)((char *)src2->data + col_idx * idx_row_size);
         memset(vy, 0, ne00*4);
-        // maybe write a special axpy for batch 1
-        // while(true) {
-            // const int ir0 = atomic_fetch_add(params->aic, dr);
             for (int64_t ir1 = ir10; ir1 < ir10+dr; ir1++) {
                 if (ir1 >= nr) {
                     break;
                 }
-		        if (src1_ptr[ir1]==0)
+		        if (src1_ptr[ir1]==0) {
 			        continue;
-                if (!gpu_idx || gpu_idx[ir1] == 1) {
+		        }
+                if (ggml_axpy_skip_gpu_idx && (!gpu_idx || gpu_idx[ir1] == 1)) {
                     continue;
                 }
-                if (sparse_idx[ir1] < threshold)
+                if (sparse_idx[ir1] < threshold) {
                     continue;
-                // ggml_axpy_normal_f16(ne00, src0_row+nb01*ir1, vy, vy, wdata[ir1]);
+                }
                 ggml_axpy_avx_f16(ne00, (ggml_fp16_t *)(src0_row+nb01*ir1), (ggml_fp16_t *)vy, vy, src1_ptr[ir1]);
             }
         

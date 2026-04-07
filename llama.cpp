@@ -3196,7 +3196,7 @@ struct llama_gpu_split_loader {
       ggml_tensor *gpu_bucket = model_layer.gpu_bucket;
       int64_t gpu_neurons = sum_gpu_index(gpu_idx);
       model_layer.gpu_offload_ratio = (double)gpu_neurons / gpu_idx->ne[0];
-      fprintf(stderr, "[DBG] layer %d: gpu_neurons=%lld / total=%lld ratio=%.4f full_gpu=%s\n",
+      LLAMA_LOG_INFO("layer %d: gpu_neurons=%lld / total=%lld ratio=%.4f full_gpu=%s\n",
               il, (long long)gpu_neurons, (long long)gpu_idx->ne[0],
               model_layer.gpu_offload_ratio,
               model_layer.gpu_offload_ratio >= 1.0 ? "YES" : "NO");
@@ -5431,12 +5431,6 @@ static struct ggml_tensor *llm_build_ffn_sparse(
     llm_ffn_gate_type type_gate, double gpu_offload_ratio,
     const llm_build_cb_short &cb_outer) {
   bool full_gpu = gpu_offload_ratio >= 1.0;
-  static int ffn_dbg_count = 0;
-  if (ffn_dbg_count < 3) {
-    fprintf(stderr, "[DBG] llm_build_ffn_sparse: ratio=%.4f full_gpu=%d gpu_index=%p gpu_bucket=%p down_gpu=%p\n",
-            gpu_offload_ratio, full_gpu, (void*)gpu_index, (void*)gpu_bucket, (void*)down_gpu);
-    ffn_dbg_count++;
-  }
   ggml_tensor *ffn_input = cur;
 
   llm_build_cb_short cb = [&cb_outer](struct ggml_tensor *tensor,
@@ -7670,6 +7664,7 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
   // [UMA-FIX] Execution mode toggles for benchmarking
   bool uma_force_cpu = (getenv("UMA_CPU_ONLY") != NULL && getenv("UMA_CPU_ONLY")[0] == '1');
   bool uma_parallel  = (getenv("UMA_PARALLEL") != NULL && getenv("UMA_PARALLEL")[0] == '1');
+  bool uma_gpu_axpy  = (getenv("UMA_GPU_AXPY") != NULL && getenv("UMA_GPU_AXPY")[0] == '1');
 
   if (lctx.ctx_metal && llama_use_sparse_inference(&model) && !uma_force_cpu) {
     // [UMA-FIX] Per-layer execution for sparse inference on UMA.
@@ -7704,12 +7699,16 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
       }
     }
 
-    if (uma_parallel) {
-      fprintf(stderr, "[UMA-FIX] PARALLEL mode: %zu ranges, %d nodes\n",
-              ranges.size(), gf->n_nodes);
-    } else {
-      fprintf(stderr, "[UMA-FIX] SEQUENTIAL mode: %zu ranges, %d nodes\n",
-              ranges.size(), gf->n_nodes);
+    static bool uma_mode_printed = false;
+    if (!uma_mode_printed) {
+      if (uma_parallel) {
+        fprintf(stderr, "[UMA] PARALLEL mode: GPU hot AXPY + CPU cold AXPY\n");
+      } else if (uma_gpu_axpy) {
+        fprintf(stderr, "[UMA] SEQUENTIAL mode: GPU AXPY all neurons\n");
+      } else {
+        fprintf(stderr, "[UMA] SEQUENTIAL mode: CPU all neurons\n");
+      }
+      uma_mode_printed = true;
     }
 
     for (const auto &r : ranges) {
@@ -7746,25 +7745,6 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
         for (int i = first_sparse; i < r.end; i++) {
           if (gf->nodes[i]->op == GGML_OP_AXPY) {
             last_axpy = i;
-            // Debug: print AXPY tensor details once
-            static bool axpy_diag = false;
-            if (!axpy_diag) {
-              struct ggml_tensor *an = gf->nodes[i];
-              fprintf(stderr, "[DBG] AXPY node: src0(weights)=%s ne01(rows)=%lld "
-                      "src1(act)=%s src2(sparse)=%s src3(aux)=%s\n",
-                      an->src[0] ? an->src[0]->name : "NULL",
-                      (long long)(an->src[0] ? an->src[0]->ne[1] : -1),
-                      an->src[1] ? an->src[1]->name : "NULL",
-                      an->src[2] ? an->src[2]->name : "NULL",
-                      an->src[3] ? an->src[3]->name : "NULL");
-              // Print first 8 values of src3 to see if it's gpu_index (0/1) or gpu_bucket (large ints)
-              if (an->src[3]) {
-                int *aux = (int *)an->src[3]->data;
-                fprintf(stderr, "[DBG] src3 values[0..7]: %d %d %d %d %d %d %d %d\n",
-                        aux[0], aux[1], aux[2], aux[3], aux[4], aux[5], aux[6], aux[7]);
-              }
-              axpy_diag = true;
-            }
             if (!parallel_temp_allocated) {
               ggml_metal_alloc_parallel_temp(lctx.ctx_metal, gf->nodes[i]->ne[0]);
               parallel_temp_allocated = true;
@@ -7775,52 +7755,46 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
         // parallel_end: everything up to and including last AXPY
         int parallel_end = (last_axpy >= 0) ? last_axpy + 1 : r.end;
 
-        // Debug: print range info for first token only
-        static int dbg_count = 0;
-        if (dbg_count < 33) {
-          fprintf(stderr, "[DBG] range layer=%d nodes=[%d,%d) first_sparse=%d last_axpy=%d parallel_end=%d ops:",
-                  r.layer_id, r.start, r.end, first_sparse, last_axpy, parallel_end);
-          for (int i = first_sparse; i < r.end && i < first_sparse + 8; i++) {
-            fprintf(stderr, " %s", ggml_op_name(gf->nodes[i]->op));
-          }
-          fprintf(stderr, "\n");
-          dbg_count++;
+        // ============================================================
+        // TRUE PARALLEL: CPU computes pre-AXPY ops first, then
+        // Metal AXPY (hot→temp) + CPU AXPY (cold→dst) in parallel.
+        // ============================================================
+
+        // Phase 1: CPU computes MUL_MAT_SPARSE + UNARY + MUL_MAT_SPARSE + MUL
+        // These produce the activations that AXPY reads from.
+        if (last_axpy > first_sparse) {
+          ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                         first_sparse, last_axpy, n_threads);
         }
+
+        // Phase 2: Metal AXPY (hot) + CPU AXPY (cold) in parallel
+        // Both read from the now-computed activations.
+        auto metal_ctx = lctx.ctx_metal;
+        auto metal_gf = gf;
+        int axpy_start = last_axpy;
+        int axpy_end = last_axpy + 1;
 
         ggml_metal_set_skip_sparse(false);
+        ggml_metal_set_axpy_only(true);
         ggml_metal_set_parallel_mode(true);
 
-        // Phase 1a: Metal first (AXPY → temp buffer, hot neurons)
-        ggml_metal_graph_compute_layer(lctx.ctx_metal, gf,
-                                        first_sparse, parallel_end);
+        std::thread metal_thread([metal_ctx, metal_gf, axpy_start, axpy_end]() {
+          ggml_metal_graph_compute_layer(metal_ctx, metal_gf,
+                                          axpy_start, axpy_end);
+        });
 
-        ggml_metal_set_parallel_mode(false);
+        // CPU AXPY: cold neurons → dst (runs concurrently with Metal)
+        ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                       last_axpy, last_axpy + 1, n_threads);
+
+        // Wait for Metal thread to finish
+        metal_thread.join();
+        ggml_metal_set_axpy_only(false);
         ggml_metal_set_skip_sparse(true);
+        ggml_metal_set_parallel_mode(false);
 
-        // Debug: check temp buffer after Metal
+        // Merge: dst += temp (combine hot + cold neuron results)
         float *temp = ggml_metal_get_parallel_temp(lctx.ctx_metal);
-        if (temp && last_axpy >= 0 && r.layer_id == 0) {
-          float sum = 0;
-          for (int j = 0; j < 16; j++) sum += temp[j];
-          fprintf(stderr, "[DEBUG] layer 0: temp[0..3]=%f %f %f %f sum16=%f\n",
-                  temp[0], temp[1], temp[2], temp[3], sum);
-        }
-
-        // Phase 1b: CPU second (AXPY → dst, cold neurons)
-        std::vector<uint8_t> parallel_buf;
-        ggml_graph_compute_sparse_cpu(parallel_buf, gf,
-                                       first_sparse, parallel_end, n_threads);
-
-        // Debug: check dst after CPU
-        if (last_axpy >= 0 && r.layer_id == 0) {
-          float *dst_data = (float *)gf->nodes[last_axpy]->data;
-          float sum = 0;
-          for (int j = 0; j < 16; j++) sum += dst_data[j];
-          fprintf(stderr, "[DEBUG] layer 0: dst[0..3]=%f %f %f %f sum16=%f\n",
-                  dst_data[0], dst_data[1], dst_data[2], dst_data[3], sum);
-        }
-
-        // Phase 2: Merge AXPY results — dst += temp (hot + cold)
         if (temp && last_axpy >= 0) {
           float *dst_data = (float *)gf->nodes[last_axpy]->data;
           int64_t ne00 = gf->nodes[last_axpy]->ne[0];
@@ -7836,11 +7810,66 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
         }
       } else if (first_sparse < r.end) {
         // ============================================================
-        // SEQUENTIAL MODE: CPU executes ALL nodes from first sparse op
-        // onward (sparse FFN + downstream dense ops like residual ADD)
+        // SEQUENTIAL MODE: CPU handles pre-AXPY ops, Metal handles AXPY
+        // (all neurons), CPU handles post-AXPY ops.
+        // Metal GPU has more execution units for the AXPY accumulation.
         // ============================================================
-        ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
-                                       first_sparse, r.end, n_threads);
+
+        // Find AXPY node in this range
+        int seq_axpy = -1;
+        for (int i = first_sparse; i < r.end; i++) {
+          if (gf->nodes[i]->op == GGML_OP_AXPY) { seq_axpy = i; break; }
+        }
+
+        if (seq_axpy >= 0 && uma_gpu_axpy) {
+          // Phase 1: CPU processes pre-AXPY ops (MUL_MAT_SPARSE, UNARY, MUL_MAT_SPARSE, MUL)
+          if (seq_axpy > first_sparse) {
+            ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                           first_sparse, seq_axpy, n_threads);
+          }
+
+          // Phase 2: Metal AXPY — all neurons, no gpu_idx filtering
+          ggml_metal_set_skip_sparse(false);
+          ggml_metal_set_axpy_only(true);
+          ggml_metal_set_axpy_all_neurons(true);
+          ggml_metal_graph_compute_layer(lctx.ctx_metal, gf,
+                                          seq_axpy, seq_axpy + 1);
+          ggml_metal_set_axpy_all_neurons(false);
+          ggml_metal_set_axpy_only(false);
+          ggml_metal_set_skip_sparse(true);
+
+          // EXPERIMENT: Run CPU AXPY for side effects, then restore Metal result
+          {
+            struct ggml_tensor *axpy_node = gf->nodes[seq_axpy];
+            int64_t ne = axpy_node->ne[0];
+            float *d = (float *)axpy_node->data;
+            float *metal_save = (float *)malloc(ne * sizeof(float));
+            memcpy(metal_save, d, ne * sizeof(float));
+
+            extern bool ggml_axpy_skip_gpu_idx;
+            ggml_axpy_skip_gpu_idx = false;
+            ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                           seq_axpy, seq_axpy + 1, n_threads);
+            ggml_axpy_skip_gpu_idx = true;
+
+            // Restore Metal result — discard CPU values
+            memcpy(d, metal_save, ne * sizeof(float));
+            free(metal_save);
+          }
+
+          // Phase 3: CPU processes post-AXPY ops (ADD, etc.)
+          if (seq_axpy + 1 < r.end) {
+            ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                           seq_axpy + 1, r.end, n_threads);
+          }
+        } else {
+          // No AXPY in range or GPU AXPY not enabled — CPU handles everything
+          extern bool ggml_axpy_skip_gpu_idx;
+          ggml_axpy_skip_gpu_idx = false;
+          ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                         first_sparse, r.end, n_threads);
+          ggml_axpy_skip_gpu_idx = true;
+        }
       }
     }
   } else if (lctx.ctx_metal && !uma_force_cpu) {
@@ -7849,7 +7878,11 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
     ggml_metal_graph_compute(lctx.ctx_metal, gf);
   } else {
     // Pure CPU path (also used when UMA_CPU_ONLY=1 for benchmarking)
+    // Must process ALL neurons — no Metal to handle hot ones
+    extern bool ggml_axpy_skip_gpu_idx;
+    ggml_axpy_skip_gpu_idx = false;
     ggml_graph_compute_helper(lctx.work_buffer, gf, n_threads);
+    ggml_axpy_skip_gpu_idx = true;
   }
 #else
   ggml_graph_compute_helper(lctx.work_buffer, gf, n_threads);

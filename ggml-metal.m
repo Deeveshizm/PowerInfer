@@ -153,6 +153,23 @@ void ggml_metal_set_skip_sparse(bool skip) {
     ggml_metal_skip_sparse_ops = skip;
 }
 
+// [UMA-FIX] When true, Metal only processes AXPY ops, skips all others.
+// Used in sequential mode so Metal handles hot neurons in AXPY while
+// CPU handles everything else (MUL_MAT_SPARSE, UNARY, MUL, ADD) + cold AXPY.
+bool ggml_metal_axpy_only = false;
+
+void ggml_metal_set_axpy_only(bool axpy_only) {
+    ggml_metal_axpy_only = axpy_only;
+}
+
+// [UMA-FIX] When true, Metal AXPY processes ALL neurons (ignores gpu_idx).
+// Used when GPU handles all AXPY computation and CPU doesn't do AXPY at all.
+bool ggml_metal_axpy_all_neurons = false;
+
+void ggml_metal_set_axpy_all_neurons(bool all_neurons) {
+    ggml_metal_axpy_all_neurons = all_neurons;
+}
+
 // [UMA-FIX] Parallel mode: redirect AXPY output to a temp buffer
 // so CPU and GPU can process hot/cold neurons without racing.
 bool ggml_metal_parallel_mode = false;
@@ -986,11 +1003,15 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
           // In sequential mode: CPU handles sparse ops after Metal finishes attention.
           // In parallel/full-Metal mode: Metal handles sparse ops directly.
           case GGML_OP_MUL_MAT_SPARSE:
+            if (ggml_metal_skip_sparse_ops || ggml_metal_axpy_only) continue;
+            break;
           case GGML_OP_AXPY:
             if (ggml_metal_skip_sparse_ops) continue;
             break;
-          default: {
-          } break;
+          default:
+            // In axpy_only mode, skip all non-AXPY ops
+            if (ggml_metal_axpy_only) continue;
+            break;
           }
 
           const int64_t ne00 = src0 ? src0->ne[0] : 0;
@@ -2001,7 +2022,7 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
               struct ggml_tensor *src3_axpy = dst->src[3];
               size_t offs_src3_axpy = 0;
               id<MTLBuffer> id_src3_axpy = src3_axpy ? ggml_metal_get_buffer(ctx, src3_axpy, &offs_src3_axpy) : nil;
-              int has_gpu_idx = (src3_axpy != NULL) ? 1 : 0;
+              int has_gpu_idx = (src3_axpy != NULL && !ggml_metal_axpy_all_neurons) ? 1 : 0;
 
               // Select kernel based on weight type
               switch (src0t) {
@@ -2036,15 +2057,21 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
               [encoder setBytes:&ne00 length:sizeof(ne00) atIndex:5];
               [encoder setBytes:&ne01 length:sizeof(ne01) atIndex:6];
               [encoder setBytes:&nb01 length:sizeof(nb01) atIndex:7];
-              // [UMA-FIX BP7] When gpu_idx is NULL (striped tensor, full-GPU mode),
+              // [UMA-FIX BP7] When gpu_idx is truly NULL (no tensor at all),
               // all rows are hot — set threshold to -FLT_MAX so all rows pass.
-              if (has_gpu_idx == 0) {
+              // When axpy_all_neurons, gpu_idx exists but we ignore it — still use normal threshold.
+              if (has_gpu_idx == 0 && src3_axpy == NULL) {
                   float neg_inf = -FLT_MAX;
                   [encoder setBytes:&neg_inf length:sizeof(neg_inf) atIndex:8];
               } else {
                   [encoder setBytes:&ggml_metal_sparse_threshold length:sizeof(ggml_metal_sparse_threshold) atIndex:8];
               }
               [encoder setBytes:&has_gpu_idx length:sizeof(has_gpu_idx) atIndex:9];
+
+              // accumulate=0 (overwrite) when Metal is sole AXPY writer (all-neurons mode)
+              // accumulate=1 when Metal needs to add to existing dst (parallel mode after CPU)
+              int accumulate_flag = ggml_metal_parallel_mode ? 1 : 0;
+              [encoder setBytes:&accumulate_flag length:sizeof(accumulate_flag) atIndex:10];
 
               // One threadgroup per 32-column chunk, 32 threads per group (one SIMD group)
               const int64_t n_threadgroups = (ne00 + 31) / 32;
@@ -2126,6 +2153,163 @@ void ggml_metal_graph_compute_layer(struct ggml_metal_context *ctx,
   };
 
   ggml_metal_graph_compute(ctx, &sub_gf);
+}
+
+// [UMA-FIX] Non-blocking Metal dispatch for parallel CPU+GPU execution.
+// Encodes and commits the command buffer but does NOT wait for completion.
+// Call ggml_metal_graph_wait() after CPU work is done to synchronize.
+static id<MTLCommandBuffer> ggml_metal_async_command_buffer = nil;
+
+void ggml_metal_graph_compute_async(struct ggml_metal_context *ctx,
+                                     struct ggml_cgraph *gf,
+                                     int node_start,
+                                     int node_end) {
+  if (node_start >= node_end) return;
+
+  struct ggml_cgraph sub_gf = {
+    .size    = node_end - node_start,
+    .n_nodes = node_end - node_start,
+    .n_leafs = 0,
+    .nodes   = gf->nodes + node_start,
+    .grads   = NULL,
+    .leafs   = NULL,
+    .visited_hash_table = { 0, NULL },
+    .perf_runs   = 0,
+    .perf_cycles = 0,
+    .perf_time_us = 0,
+  };
+
+  @autoreleasepool {
+    MTLComputePassDescriptor *edesc = MTLComputePassDescriptor.computePassDescriptor;
+    edesc.dispatchType = MTLDispatchTypeSerial;
+
+    id<MTLCommandBuffer> command_buffer = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder =
+        [command_buffer computeCommandEncoderWithDescriptor:edesc];
+
+    // Store for the main graph compute encoding — temporarily override ctx
+    ctx->command_buffers[0] = command_buffer;
+    ctx->command_encoders[0] = encoder;
+
+    // Encode ops using the same dispatch_async block logic but inline
+    // Since n_cb=1, we encode directly on this thread
+    size_t offs_src0 = 0, offs_src1 = 0, offs_dst = 0;
+
+    for (int ind = 0; ind < sub_gf.n_nodes; ++ind) {
+      struct ggml_tensor *src0 = sub_gf.nodes[ind]->src[0];
+      struct ggml_tensor *src1 = sub_gf.nodes[ind]->src[1];
+      struct ggml_tensor *dst  = sub_gf.nodes[ind];
+
+      // Apply same filtering as ggml_metal_graph_compute
+      switch (dst->op) {
+      case GGML_OP_NONE:
+      case GGML_OP_RESHAPE:
+      case GGML_OP_VIEW:
+      case GGML_OP_TRANSPOSE:
+      case GGML_OP_PERMUTE:
+        continue;
+      case GGML_OP_MUL_MAT_SPARSE:
+        if (ggml_metal_skip_sparse_ops || ggml_metal_axpy_only) continue;
+        break;
+      case GGML_OP_AXPY:
+        if (ggml_metal_skip_sparse_ops) continue;
+        break;
+      default:
+        if (ggml_metal_axpy_only) continue;
+        break;
+      }
+
+      // Get Metal buffers
+      size_t offs_src2 = 0;
+      id<MTLBuffer> id_src0 = src0 ? ggml_metal_get_buffer(ctx, src0, &offs_src0) : nil;
+      id<MTLBuffer> id_src1 = src1 ? ggml_metal_get_buffer(ctx, src1, &offs_src1) : nil;
+      id<MTLBuffer> id_dst  = ggml_metal_get_buffer(ctx, dst, &offs_dst);
+
+      // Only AXPY should reach here in axpy_only mode
+      if (dst->op != GGML_OP_AXPY) continue;
+
+      struct ggml_tensor *src2 = dst->src[2];
+      id<MTLBuffer> id_src2 = src2 ? ggml_metal_get_buffer(ctx, src2, &offs_src2) : nil;
+
+      GGML_ASSERT(src2 != NULL);
+
+      struct ggml_tensor *src3_axpy = dst->src[3];
+      size_t offs_src3_axpy = 0;
+      id<MTLBuffer> id_src3_axpy = src3_axpy ? ggml_metal_get_buffer(ctx, src3_axpy, &offs_src3_axpy) : nil;
+      int has_gpu_idx = (src3_axpy != NULL && !ggml_metal_axpy_all_neurons) ? 1 : 0;
+
+      const enum ggml_type src0t = src0->type;
+      const int64_t ne00 = src0->ne[0];
+      const int64_t ne01 = src0->ne[1];
+      const uint64_t nb01 = src0->nb[1];
+
+      switch (src0t) {
+      case GGML_TYPE_F16:
+        [encoder setComputePipelineState:ctx->pipeline_axpy_f16];
+        break;
+      case GGML_TYPE_Q4_0:
+        [encoder setComputePipelineState:ctx->pipeline_axpy_q4_0];
+        break;
+      default:
+        GGML_ASSERT(false && "AXPY type not implemented for async Metal");
+      }
+
+      [encoder setBuffer:id_src0 offset:offs_src0 atIndex:0];
+      [encoder setBuffer:id_src1 offset:offs_src1 atIndex:1];
+      if (ggml_metal_parallel_mode && ggml_metal_parallel_temp_mtl) {
+        memset(ggml_metal_parallel_temp_data, 0, ne00 * sizeof(float));
+        [encoder setBuffer:ggml_metal_parallel_temp_mtl offset:0 atIndex:2];
+      } else {
+        [encoder setBuffer:id_dst offset:offs_dst atIndex:2];
+      }
+      [encoder setBuffer:id_src2 offset:offs_src2 atIndex:3];
+      if (id_src3_axpy) {
+        [encoder setBuffer:id_src3_axpy offset:offs_src3_axpy atIndex:4];
+      } else {
+        [encoder setBuffer:id_src0 offset:0 atIndex:4];
+      }
+      [encoder setBytes:&ne00 length:sizeof(ne00) atIndex:5];
+      [encoder setBytes:&ne01 length:sizeof(ne01) atIndex:6];
+      [encoder setBytes:&nb01 length:sizeof(nb01) atIndex:7];
+      if (has_gpu_idx == 0 && src3_axpy == NULL) {
+        float neg_inf = -FLT_MAX;
+        [encoder setBytes:&neg_inf length:sizeof(neg_inf) atIndex:8];
+      } else {
+        [encoder setBytes:&ggml_metal_sparse_threshold length:sizeof(ggml_metal_sparse_threshold) atIndex:8];
+      }
+      [encoder setBytes:&has_gpu_idx length:sizeof(has_gpu_idx) atIndex:9];
+
+      int accumulate_flag = ggml_metal_parallel_mode ? 1 : 0;
+      [encoder setBytes:&accumulate_flag length:sizeof(accumulate_flag) atIndex:10];
+
+      const int64_t n_threadgroups = (ne00 + 31) / 32;
+      [encoder dispatchThreadgroups:MTLSizeMake(n_threadgroups, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+
+    [encoder endEncoding];
+    [command_buffer commit];
+    // Do NOT wait — caller runs CPU work then calls ggml_metal_graph_wait()
+    ggml_metal_async_command_buffer = command_buffer;
+  }
+}
+
+void ggml_metal_graph_wait(void) {
+  if (ggml_metal_async_command_buffer != nil) {
+    [ggml_metal_async_command_buffer waitUntilCompleted];
+
+    MTLCommandBufferStatus status =
+        (MTLCommandBufferStatus)[ggml_metal_async_command_buffer status];
+    if (status != MTLCommandBufferStatusCompleted) {
+      GGML_METAL_LOG_ERROR("ggml_metal_graph_wait: command buffer failed with status %lu\n", status);
+      NSError *error = [ggml_metal_async_command_buffer error];
+      if (error) {
+        GGML_METAL_LOG_ERROR("  error: %s\n", [[error localizedDescription] UTF8String]);
+      }
+      GGML_ASSERT(false);
+    }
+    ggml_metal_async_command_buffer = nil;
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////

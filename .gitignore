@@ -4,9 +4,11 @@
 *.gguf
 *.bin
 
-# UMA research files
-UMA_METAL_CHANGES.md
-UMA_RESEARCH_FINDINGS.md
+# UMA research docs (local only)
+docs/UMA_*.md
+
+# Claude Code worktrees
+.claude/
 
 # Benchmark output files
 baseline_*.txt
