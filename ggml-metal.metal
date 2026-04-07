@@ -2927,3 +2927,382 @@ template [[host_name("kernel_mul_mm_q3_K_f32")]] kernel mat_mm_t kernel_mul_mm<b
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mat_mm_t kernel_mul_mm<block_q4_K, QK_NL, dequantize_q4_K>;
 template [[host_name("kernel_mul_mm_q5_K_f32")]] kernel mat_mm_t kernel_mul_mm<block_q5_K, QK_NL, dequantize_q5_K>;
 template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mat_mm_t kernel_mul_mm<block_q6_K, QK_NL, dequantize_q6_K>;
+
+// --- SPARSE KERNEL ADDED BY ANTIGRAVITY ---
+#if QK_K == 256
+kernel void kernel_mul_mv_q4_K_f32_sparse(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01 [[buffer(4)]],
+        constant   int64_t & ne02 [[buffer(5)]],
+        constant   int64_t & ne10 [[buffer(9)]],
+        constant   int64_t & ne12 [[buffer(11)]],
+        constant   int64_t & ne0  [[buffer(15)]],
+        constant   int64_t & ne1  [[buffer(16)]],
+        constant   uint    & gqa  [[buffer(17)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint tiisg[[thread_index_in_simdgroup]],
+        uint sgitg[[simdgroup_index_in_threadgroup]],
+        device const float * sparse_idx [[buffer(18)]],
+        constant float & sparse_threshold [[buffer(19)]]) {
+
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const int ix = tiisg/8;  // 0...3
+    const int it = tiisg%8;  // 0...7
+    const int im = it/4;     // 0 or 1
+    const int ir = it%4;     // 0...3
+
+    const int nb = ne00/QK_K;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int r2 = tgpig.z;
+    //const int first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST;
+    const int first_row = r0 * N_DST;
+    const int ib_row = first_row * nb;
+    const uint offset0 = r2/gqa*(nb*ne0);
+    device const block_q4_K * x = (device const block_q4_K *) src0 + ib_row + offset0;
+    device const float      * y = (device const float      *) src1 + r1*ne10 + r2*ne00*ne1;
+    float yl[16];
+    float yh[16];
+    float sumf[N_DST]={0.f}, all_sum;
+
+    const int step = sizeof(block_q4_K) * nb / 2;
+
+    device const float * y4 = y + ix * QK_K + 64 * im + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (int i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+
+        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + im;
+        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * im + 4 * ir;
+        device const half     * dh = &x[ib].d;
+
+        for (int row = 0; row < N_DST; row++) {
+            // Bounds check: skip if this row exceeds the matrix dimensions
+            if (first_row + row >= ne01) {
+                q1 += step;
+                sc += step;
+                dh += step;
+                continue;
+            }
+            if (sparse_idx[first_row + row] < sparse_threshold) {
+                q1 += step;
+                sc += step;
+                dh += step;
+                continue;
+            }
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            for (int i = 0; i < 8; i += 2) {
+                acc1[0] += yl[i+0] * (q1[i/2] & 0x000F);
+                acc1[1] += yl[i+1] * (q1[i/2] & 0x0F00);
+                acc1[2] += yl[i+8] * (q1[i/2] & 0x00F0);
+                acc1[3] += yl[i+9] * (q1[i/2] & 0xF000);
+                acc2[0] += yh[i+0] * (q2[i/2] & 0x000F);
+                acc2[1] += yh[i+1] * (q2[i/2] & 0x0F00);
+                acc2[2] += yh[i+8] * (q2[i/2] & 0x00F0);
+                acc2[3] += yh[i+9] * (q2[i/2] & 0xF000);
+            }
+
+            float dall = dh[0];
+            float dmin = dh[1];
+            sumf[row] += dall * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                 (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                 (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                 (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1 += step;
+            sc += step;
+            dh += step;
+        }
+
+        y4 += 4 * QK_K;
+    }
+
+    for (int row = 0; row < N_DST; ++row) {
+        all_sum = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst[r1*ne0 + r2*ne0*ne1 + first_row + row] = all_sum;
+        }
+    }
+}
+#else
+kernel void kernel_mul_mv_q4_K_f32_sparse(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01[[buffer(4)]],
+        constant   int64_t & ne02[[buffer(5)]],
+        constant   int64_t & ne10[[buffer(9)]],
+        constant   int64_t & ne12[[buffer(11)]],
+        constant   int64_t & ne0[[buffer(15)]],
+        constant   int64_t & ne1[[buffer(16)]],
+        constant   uint    & gqa[[buffer(17)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint tiisg[[thread_index_in_simdgroup]],
+        uint sgitg[[simdgroup_index_in_threadgroup]],
+        device const float * sparse_idx [[buffer(18)]],
+        constant float & sparse_threshold [[buffer(19)]]) {
+
+    const int ix = tiisg/4;  // 0...7
+    const int it = tiisg%4;  // 0...3
+
+    const int nb = ne00/QK_K;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int r2 = tgpig.z;
+    const int first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST;
+    const int ib_row = first_row * nb;
+    const uint offset0 = r2/gqa*(nb*ne0);
+    device const block_q4_K * x = (device const block_q4_K *) src0 + ib_row + offset0;
+    device const float      * y = (device const float      *) src1 + r1*ne10 + r2*ne00*ne1;
+    float yl[8];
+    float yh[8];
+    float sumf[N_DST]={0.f}, all_sum;
+
+    const int step = sizeof(block_q4_K) * nb / 2;
+
+    device const float * y4 = y + ix * QK_K + 8 * it;
+
+    uint16_t sc16[4];
+
+    for (int ib = ix; ib < nb; ib += 8) {
+
+        float2 sumy = {0.f, 0.f};
+        for (int i = 0; i < 8; ++i) {
+            yl[i] = y4[i+ 0]; sumy[0] += yl[i];
+            yh[i] = y4[i+32]; sumy[1] += yh[i];
+        }
+
+        device const uint16_t * sc = (device const uint16_t *)x[ib].scales;
+        device const uint16_t * qs = (device const uint16_t *)x[ib].qs + 4 * it;
+        device const half     * dh = x[ib].d;
+
+        for (int row = 0; row < N_DST; row++) {
+            if (sparse_idx[first_row + row] < sparse_threshold) {
+                qs += step;
+                sc += step;
+                dh += step;
+                continue;
+            }
+
+            sc16[0] = sc[0] & 0x000f;
+            sc16[1] = sc[0] & 0x0f00;
+            sc16[2] = sc[0] & 0x00f0;
+            sc16[3] = sc[0] & 0xf000;
+
+            float2 acc1 = {0.f, 0.f};
+            float2 acc2 = {0.f, 0.f};
+            for (int i = 0; i < 8; i += 2) {
+                acc1[0] += yl[i+0] * (qs[i/2] & 0x000F);
+                acc1[1] += yl[i+1] * (qs[i/2] & 0x0F00);
+                acc2[0] += yh[i+0] * (qs[i/2] & 0x00F0);
+                acc2[1] += yh[i+1] * (qs[i/2] & 0xF000);
+            }
+
+            float dall = dh[0];
+            float dmin = dh[1];
+            sumf[row] += dall * ((acc1[0] + 1.f/256.f * acc1[1]) * sc16[0] +
+                                 (acc2[0] + 1.f/256.f * acc2[1]) * sc16[1] * 1.f/4096.f) -
+                         dmin * 1.f/16.f * (sumy[0] * sc16[2] + sumy[1] * sc16[3] * 1.f/256.f);
+
+            qs += step;
+            sc += step;
+            dh += step;
+        }
+
+        y4 += 8 * QK_K;
+    }
+
+    for (int row = 0; row < N_DST; ++row) {
+        all_sum = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst[r1*ne0+ r2*ne0*ne1 + first_row + row] = all_sum;
+        }
+    }
+}
+#endif
+
+// [UMA-FIX BP3b] Sparse F16 mul_mv kernel — see UMA_METAL_CHANGES.md for reasoning
+kernel void kernel_mul_mv_f16_f32_sparse(
+        device const  char  * src0,
+        device const  char  * src1,
+        device       float  * dst,
+        constant   int64_t  & ne00,
+        constant   int64_t  & ne01 [[buffer(4)]],
+        constant   int64_t  & ne02 [[buffer(5)]],
+        constant  uint64_t  & nb00 [[buffer(6)]],
+        constant  uint64_t  & nb01 [[buffer(7)]],
+        constant  uint64_t  & nb02 [[buffer(8)]],
+        constant   int64_t  & ne10 [[buffer(9)]],
+        constant   int64_t  & ne11 [[buffer(10)]],
+        constant   int64_t  & ne12 [[buffer(11)]],
+        constant  uint64_t  & nb10 [[buffer(12)]],
+        constant  uint64_t  & nb11 [[buffer(13)]],
+        constant  uint64_t  & nb12 [[buffer(14)]],
+        constant   int64_t  & ne0  [[buffer(15)]],
+        constant   int64_t  & ne1  [[buffer(16)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        device const float  * sparse_idx [[buffer(18)]],
+        constant     float  & sparse_threshold [[buffer(19)]]) {
+
+    const int64_t r0 = tgpig.x;
+    const int64_t r1 = tgpig.y;
+    const int64_t im = tgpig.z;
+
+    // Sparse filtering: skip rows below threshold
+    if (sparse_idx[r0] < sparse_threshold) {
+        if (tiisg == 0) {
+            dst[im*ne1*ne0 + r1*ne0 + r0] = 0.0f;
+        }
+        return;
+    }
+
+    device const half  * x = (device const half  *) (src0 + r0*nb01 + im/(ne12/ne02)*nb02);
+    device const float * y = (device const float *) (src1 + r1*nb11 + im*nb12);
+
+    float sumf = 0;
+    if (ne00 < 128) {
+        for (int i = tiisg; i < ne00; i += 32) {
+            sumf += (float) x[i] * (float) y[i];
+        }
+        float all_sum = simd_sum(sumf);
+        if (tiisg == 0) {
+            dst[im*ne1*ne0 + r1*ne0 + r0] = all_sum;
+        }
+    } else {
+        device const half4  * x4 = (device const half4 *)x;
+        device const float4 * y4 = (device const float4 *)y;
+        for (int i = tiisg; i < ne00/4; i += 32) {
+            for (int k = 0; k < 4; ++k) sumf += (float)x4[i][k] * y4[i][k];
+        }
+        float all_sum = simd_sum(sumf);
+        if (tiisg == 0) {
+            for (int i = 4*(ne00/4); i < ne00; ++i) all_sum += (float) x[i] * y[i];
+            dst[im*ne1*ne0 + r1*ne0 + r0] = all_sum;
+        }
+    }
+}
+
+// [UMA-FIX BP3] AXPY kernels for sparse inference
+// Performs: dst[col] += sum_over_active_rows( src1[row] * src0[row][col] )
+// where active rows are determined by sparse_idx >= threshold
+// Mirrors CPU implementation in ggml.c:ggml_compute_forward_mul_mat_axpy()
+// =============================================================================
+
+// F16 weight variant: src0 = weight matrix (f16), src1 = activations (f32), dst = output (f32)
+// NOTE: src1 is f32 (not f16) because it comes from MUL_MAT_SPARSE→ReLU→MUL which outputs f32
+kernel void kernel_axpy_f16(
+        device const half   * src0       [[buffer(0)]],   // weight matrix (ne00 x ne01), row-major
+        device const float  * src1       [[buffer(1)]],   // activation scalars (ne01) — f32!
+        device       float  * dst        [[buffer(2)]],   // output vector (ne00)
+        device const float  * sparse_idx [[buffer(3)]],   // sparsity predictions (ne01)
+        device const int    * gpu_idx    [[buffer(4)]],   // gpu bucket flags; guarded by has_gpu_idx
+        constant   int64_t  & ne00       [[buffer(5)]],   // number of columns (output dim)
+        constant   int64_t  & ne01       [[buffer(6)]],   // number of rows (input neurons)
+        constant   uint64_t & nb01       [[buffer(7)]],   // byte stride per row in src0
+        constant   float    & threshold  [[buffer(8)]],   // sparsity threshold
+        constant   int      & has_gpu_idx [[buffer(9)]],  // whether gpu_idx buffer is valid
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tiisg [[thread_index_in_simdgroup]]) {
+
+    // Each thread handles one column
+    const int col = tgpig * 32 + tiisg;
+    if (col >= ne00) return;
+
+    float sum = 0.0f;
+
+    for (int row = 0; row < ne01; row++) {
+        // Skip zero activations (common in ReLU-activated models)
+        if (src1[row] == 0.0f) continue;
+
+        // Skip rows below sparsity threshold (predicted inactive neurons)
+        if (sparse_idx[row] < threshold) continue;
+
+        // UMA mode: when has_gpu_idx==0, process all active rows (no CPU/GPU split).
+        // When has_gpu_idx==1, Metal handles gpu_idx==1 rows (GPU-assigned neurons).
+        if (has_gpu_idx && gpu_idx[row] == 0) continue;
+
+        device const half * src0_row = (device const half *)((device const char *)src0 + row * nb01);
+        sum += src1[row] * (float)src0_row[col];
+    }
+
+    // Write result (not accumulate — Metal doesn't have CPU's INIT zero phase)
+    dst[col] = sum;
+}
+
+// Q4_0 quantized weight variant
+// Q4_0 block: 32 values packed as 16 bytes (4-bit) + 1 f16 scale = 18 bytes per block
+kernel void kernel_axpy_q4_0(
+        device const char   * src0       [[buffer(0)]],   // weight matrix, Q4_0 quantized
+        device const float  * src1       [[buffer(1)]],   // activation scalars (f32)
+        device       float  * dst        [[buffer(2)]],   // output vector (f32)
+        device const float  * sparse_idx [[buffer(3)]],   // sparsity predictions
+        device const int    * gpu_idx    [[buffer(4)]],   // gpu bucket flags
+        constant   int64_t  & ne00       [[buffer(5)]],   // number of columns
+        constant   int64_t  & ne01       [[buffer(6)]],   // number of rows
+        constant   uint64_t & nb01       [[buffer(7)]],   // byte stride per row
+        constant   float    & threshold  [[buffer(8)]],   // sparsity threshold
+        constant   int      & has_gpu_idx [[buffer(9)]],  // whether gpu_idx is valid
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tiisg [[thread_index_in_simdgroup]]) {
+
+    const int col = tgpig * 32 + tiisg;
+    if (col >= ne00) return;
+
+    const int block_idx = col / 32;
+    const int in_block  = col % 32;
+    // Q4_0 layout: low nibbles → positions 0–15, high nibbles → positions 16–31
+    const int quant_byte = (in_block < 16) ? in_block : (in_block - 16);
+    const int quant_nib  = (in_block < 16) ? 0 : 1;
+
+    float sum = 0.0f;
+
+    for (int row = 0; row < ne01; row++) {
+        if (src1[row] == 0.0f) continue;
+        if (sparse_idx[row] < threshold) continue;
+        if (has_gpu_idx && gpu_idx[row] == 0) continue;
+
+        device const char * row_data = src0 + row * nb01;
+
+        // Each Q4_0 block: 2 bytes (f16 scale) + 16 bytes (32 x 4-bit quants)
+        device const half * scale_ptr = (device const half *)(row_data + block_idx * 18);
+        device const uint8_t * quants = (device const uint8_t *)(row_data + block_idx * 18 + 2);
+
+        float scale = (float)(*scale_ptr);
+        uint8_t qbyte = quants[quant_byte];
+        int qval = (quant_nib == 0) ? (qbyte & 0x0F) : (qbyte >> 4);
+        float weight = scale * ((float)qval - 8.0f);  // Q4_0 offset = 8
+
+        sum += src1[row] * weight;
+    }
+
+    // Write result (not accumulate — Metal doesn't have CPU's INIT zero phase)
+    dst[col] = sum;
+}

@@ -644,6 +644,8 @@ int main(int argc, char ** argv) {
         if (input_echo) {
             for (auto id : embd) {
                 const std::string token_str = llama_token_to_piece(ctx, id);
+                // [UMA-FIX DEBUG] Log token IDs to stderr for debugging
+                fprintf(stderr, "[DEBUG token_id=%d '%s']\n", id, token_str.c_str());
                 printf("%s", token_str.c_str());
 
                 if (embd.size() > 1) {

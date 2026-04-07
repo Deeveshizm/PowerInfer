@@ -26,7 +26,10 @@
 #include <stdbool.h>
 
 // max memory buffers that can be mapped to the device
-#define GGML_METAL_MAX_BUFFERS 64
+// [UMA-FIX BP6] Increased from 64 to 512 for sparse models where individual
+// tensors are auto-registered via UMA (model can have 355+ tensors)
+// #define GGML_METAL_MAX_BUFFERS 64
+#define GGML_METAL_MAX_BUFFERS 512
 #define GGML_METAL_MAX_COMMAND_BUFFERS 32
 
 struct ggml_tensor;
@@ -89,6 +92,22 @@ int * ggml_metal_get_concur_list(struct ggml_metal_context * ctx);
 // creates gf->n_threads command buffers in parallel
 void ggml_metal_graph_compute(struct ggml_metal_context * ctx, struct ggml_cgraph * gf);
 
+// [UMA-FIX] Per-layer Metal execution for sparse inference on UMA
+// Executes only dense ops (attention) in [node_start, node_end) range,
+// skipping sparse ops (MUL_MAT_SPARSE, AXPY) which are handled by CPU.
+// Each call creates, commits, and waits on its own command buffer.
+void ggml_metal_graph_compute_layer(
+        struct ggml_metal_context * ctx,
+        struct ggml_cgraph * gf,
+        int node_start,
+        int node_end);
+
+// [UMA-FIX] Parallel mode: Metal writes AXPY output to a separate temp buffer
+// instead of dst, so CPU and GPU can process hot/cold neurons simultaneously.
+GGML_API void ggml_metal_set_parallel_mode(bool parallel);
+GGML_API void ggml_metal_alloc_parallel_temp(struct ggml_metal_context * ctx, int64_t ne00);
+GGML_API float * ggml_metal_get_parallel_temp(struct ggml_metal_context * ctx);
+
 //
 // backend API
 // user-code should use only these functions
@@ -99,6 +118,9 @@ GGML_API ggml_backend_t ggml_backend_metal_init(void);
 GGML_API bool ggml_backend_is_metal(ggml_backend_t backend);
 
 GGML_API void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb);
+
+GGML_API void ggml_metal_set_sparse_threshold(float threshold);
+GGML_API void ggml_metal_set_skip_sparse(bool skip);
 
 #ifdef __cplusplus
 }

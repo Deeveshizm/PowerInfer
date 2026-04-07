@@ -549,7 +549,10 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[12];
+        // [UMA-FIX] Layer index for per-layer Metal execution (-1 = pre/post layer)
+        int32_t layer_id;
+
+        char padding[8];
     };
 
 

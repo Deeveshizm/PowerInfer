@@ -2498,6 +2498,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
+        /*.layer_id     =*/ -1,
         /*.padding      =*/ { 0 },
     };
 
@@ -14208,7 +14209,8 @@ static void ggml_compute_forward_mul_mat_sparse(
     // attempt to reduce false-sharing (does not seem to make a difference)
     // float tmp[16];
     float *ffdata = (float *)dst->src[2]->data;
-    int *gid = (int *)dst->src[3]->data;
+    // [UMA-FIX] Handle NULL gpu_idx (full-GPU mode with striped tensors)
+    int *gid = dst->src[3] ? (int *)dst->src[3]->data : NULL;
     float *predictor_data = (float *)dst->src[2]->data;
     const size_t predictor_row_size = dst->src[2]->ne[0]*ggml_type_size(GGML_TYPE_F32)/ggml_blck_size(GGML_TYPE_F32);
 
@@ -14252,8 +14254,8 @@ static void ggml_compute_forward_mul_mat_sparse(
 
                     float *dst_col = (float *)((char *)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
 
-                    // if (ffdata[ir0] <= 0.0f) {
-                    if (gid[ir0] == 1 || ffdata[ir0] < threshold) {
+                    // [UMA-FIX] When gid is NULL (full-GPU/striped), skip gpu check
+                    if ((gid && gid[ir0] == 1) || ffdata[ir0] < threshold) {
                         dst_col[ir0] = 0;
                         continue;
                     }
@@ -14547,8 +14549,8 @@ static void ggml_compute_forward_mul_mat_axpy_q4_0(
     const int64_t nr1 = ne11*ne12*ne13;
     float *idx = src2->data;
     int idx_row_size = src2->nb[1];
-    int *gid = (int *)(dst->src[3]->data);
-    // printf("down %d up %d ne00 %d\n", ir10, ir11, ne00);
+    // [UMA-FIX] Handle NULL gpu_idx (full-GPU mode with striped tensors)
+    int *gid = dst->src[3] ? (int *)(dst->src[3]->data) : NULL;
 
 #if defined(_MSC_VER)
     float* vec = (float *)_malloca(ne00 * 4 * sizeof(float));
@@ -14562,13 +14564,11 @@ static void ggml_compute_forward_mul_mat_axpy_q4_0(
         const block_q8_0 *restrict nerual = (block_q8_0 *)((char *)wdata + col_idx * row_size);
         idx = (float *)((char *)src2->data + col_idx * idx_row_size);
         memset(vy, 0, ne00 * 4);
-        // while(true) {
-        //     const int ir0 = atomic_fetch_add(params->aic, dr);
         for (int64_t ir1 = ir10; ir1 < ir10 + dr; ir1++)
         {
             if (ir1 >= nr)
                 break;
-            if (gid[ir1] == 1)
+            if (gid && gid[ir1] == 1)
                 continue;
             if (idx[ir1] < threshold)
                 continue;
@@ -16711,12 +16711,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = n_threads;
 
-#if defined(GGML_USE_CUBLAS)
+// [UMA-FIX BP2] Original: only CUBLAS reduced tasks for GPU AXPY
+// #if defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_CUBLAS) || defined(GGML_USE_METAL)
                 if (node->backend == GGML_BACKEND_GPU && node->op_params[0] > 0) {
                     // Fully offloaded to GPU
                     n_tasks = 1;
+#if defined(GGML_USE_CUBLAS)
                 } else {
                     GGML_ASSERT(n_threads > 1 && "n_threads must be > 1 to enable hybrid CPU/GPU computation");
+#endif
                 }
 #endif
             } break;
@@ -20559,7 +20563,9 @@ void ggml_set_backend(struct ggml_tensor * tensor, enum ggml_backend_type backen
         return;
     }
     if (backend == GGML_BACKEND_GPU || backend == GGML_BACKEND_GPU_SPLIT) {
-        #if defined(GGML_USE_CUBLAS)
+        // [UMA-FIX BP4d] Original: only CUBLAS could set GPU backend
+        // #if defined(GGML_USE_CUBLAS)
+        #if defined(GGML_USE_CUBLAS) || defined(GGML_USE_METAL)
             tensor->backend = backend;
             return;
         #endif

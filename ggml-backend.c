@@ -204,10 +204,31 @@ void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst
         fprintf(stderr, "ggml_backend_tensor_copy: neither cpy_tensor_from nor cpy_tensor_to are implemented for backends %s and %s, falling back to get/set\n", ggml_backend_name(src->buffer->backend), ggml_backend_name(dst->buffer->backend));
         #endif
         size_t nbytes = ggml_nbytes(src);
+
+        // --- UMA OPTIMIZATION PROFILING START ---
+        int64_t t_start = ggml_time_us();
+        
         void * data = malloc(nbytes);
         ggml_backend_tensor_get(src, data, 0, nbytes);
         ggml_backend_tensor_set(dst, data, 0, nbytes);
         free(data);
+
+        int64_t t_end = ggml_time_us();
+
+        // Use a static or external variable to track total time and bytes if we want, 
+        // but for now, just print the accumulated warning if it takes significant time.
+        static int64_t total_memcpy_us = 0;
+        static int64_t total_memcpy_bytes = 0;
+        total_memcpy_us += (t_end - t_start);
+        total_memcpy_bytes += nbytes;
+        
+        // Print every 100MB copied so we don't spam stdout
+        if (total_memcpy_bytes > 100 * 1024 * 1024) {
+             fprintf(stderr, "\n[UMA BASELINE] Accumulated CPU-GPU memcpy overhead: %.2f ms (%.2f MB copied)\n", total_memcpy_us / 1000.0, total_memcpy_bytes / 1024.0 / 1024.0);
+             total_memcpy_bytes = 0;
+             total_memcpy_us = 0;
+        }
+        // --- UMA OPTIMIZATION PROFILING END ---
     }
 }
 
@@ -278,7 +299,24 @@ static void ggml_backend_cpu_set_tensor_async(ggml_backend_t backend, struct ggm
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
 
+    // --- UMA OPTIMIZATION PROFILING START ---
+    int64_t t_start = ggml_time_us();
+
     memcpy((char *)tensor->data + offset, data, size);
+
+    int64_t t_end = ggml_time_us();
+
+    static int64_t total_memcpy_us = 0;
+    static int64_t total_memcpy_bytes = 0;
+    total_memcpy_us += (t_end - t_start);
+    total_memcpy_bytes += size;
+    
+    if (total_memcpy_bytes > 100 * 1024 * 1024) {
+         fprintf(stderr, "\n[UMA BASELINE CPU SET] Accumulated CPU memcpy overhead: %.2f ms (%.2f MB copied)\n", total_memcpy_us / 1000.0, total_memcpy_bytes / 1024.0 / 1024.0);
+         total_memcpy_bytes = 0;
+         total_memcpy_us = 0;
+    }
+    // --- UMA OPTIMIZATION PROFILING END ---
 
     UNUSED(backend);
 }
@@ -287,7 +325,24 @@ static void ggml_backend_cpu_get_tensor_async(ggml_backend_t backend, const stru
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
 
+    // --- UMA OPTIMIZATION PROFILING START ---
+    int64_t t_start = ggml_time_us();
+
     memcpy(data, (const char *)tensor->data + offset, size);
+
+    int64_t t_end = ggml_time_us();
+
+    static int64_t total_memcpy_us = 0;
+    static int64_t total_memcpy_bytes = 0;
+    total_memcpy_us += (t_end - t_start);
+    total_memcpy_bytes += size;
+    
+    if (total_memcpy_bytes > 100 * 1024 * 1024) {
+         fprintf(stderr, "\n[UMA BASELINE CPU GET] Accumulated CPU memcpy overhead: %.2f ms (%.2f MB copied)\n", total_memcpy_us / 1000.0, total_memcpy_bytes / 1024.0 / 1024.0);
+         total_memcpy_bytes = 0;
+         total_memcpy_us = 0;
+    }
+    // --- UMA OPTIMIZATION PROFILING END ---
 
     UNUSED(backend);
 }
