@@ -123,6 +123,7 @@ GGML_API void ggml_metal_set_sparse_threshold(float threshold);
 GGML_API void ggml_metal_set_skip_sparse(bool skip);
 GGML_API void ggml_metal_set_axpy_only(bool axpy_only);
 GGML_API void ggml_metal_set_axpy_all_neurons(bool all_neurons);
+GGML_API void ggml_metal_set_full_ffn_parallel(bool enable);
 
 // Non-blocking Metal dispatch for parallel CPU+GPU AXPY
 GGML_API void ggml_metal_graph_compute_async(struct ggml_metal_context * ctx, struct ggml_cgraph * gf, int node_start, int node_end);

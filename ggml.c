@@ -14254,8 +14254,15 @@ static void ggml_compute_forward_mul_mat_sparse(
 
                     float *dst_col = (float *)((char *)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
 
-                    // [UMA-FIX] When gid is NULL (full-GPU/striped), skip gpu check
-                    if ((gid && gid[ir0] == 1) || ffdata[ir0] < threshold) {
+                    // [UMA-FIX] Skip hot neurons only when ggml_mul_mat_sparse_skip_gpu_idx is true
+                    // (true FFN parallel mode). Otherwise process all neurons.
+                    // RACE FIX: In parallel mode, do NOT write 0 to hot rows — Metal is
+                    // concurrently writing real values there. Only zero rows below threshold.
+                    extern bool ggml_mul_mat_sparse_skip_gpu_idx;
+                    if (ggml_mul_mat_sparse_skip_gpu_idx && gid && gid[ir0] == 1) {
+                        continue;  // hot row, Metal handles it, leave dst untouched
+                    }
+                    if (ffdata[ir0] < threshold) {
                         dst_col[ir0] = 0;
                         continue;
                     }
@@ -14316,6 +14323,10 @@ static void ggml_axpy_avx_f16(const int n, const ggml_fp16_t * restrict vx, cons
 // [UMA-FIX] When false, CPU AXPY processes ALL neurons (hot + cold).
 // When true (default), CPU skips hot neurons (gpu_idx==1) for parallel mode.
 bool ggml_axpy_skip_gpu_idx = true;
+
+// [UMA-FIX] When false, CPU MUL_MAT_SPARSE processes ALL neurons (hot + cold).
+// When true, CPU skips hot neurons (gpu_idx==1) for true FFN parallel mode.
+bool ggml_mul_mat_sparse_skip_gpu_idx = false;
 
 static void ggml_compute_forward_mul_mat_axpy(
         const struct ggml_compute_params * params,
@@ -14618,6 +14629,102 @@ static void ggml_compute_forward_mul_mat_axpy_q4_0(
     _freea(vec);
 #endif
 }
+// [Q4_K-FIX] AXPY for Q4_K weights using dequantize-then-accumulate approach.
+// Q4_K uses Q8_K as vec_dot_type (256 quants per block vs Q8_0's 32).
+// We dequantize each active Q4_K weight row to float, scale by activation, and accumulate.
+static void ggml_compute_forward_mul_mat_axpy_q4_K(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+              struct ggml_tensor * dst) {
+    int64_t t0 = ggml_perf_time_us();
+    UNUSED(t0);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const float threshold = sparse_pred_threshold;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_Q4_K);
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+    GGML_ASSERT(nb10 == sizeof(float));
+    GGML_ASSERT(nb0 == sizeof(float));
+
+    if (params->type == GGML_TASK_INIT) {
+        ggml_set_zero(dst);
+        return;
+    }
+
+    if (params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    // src1 is float activations (sparse_idx-gated values from gate*up)
+    struct ggml_tensor *src2 = dst->src[2];  // sparse_idx
+    int *gid = dst->src[3] ? (int *)(dst->src[3]->data) : NULL;
+
+    // Parallelize by src0 rows
+    const int64_t dr = (src2->ne[0] + nth - 1) / nth;
+    const int nr = ggml_nrows(src0);
+    const int64_t ir10 = dr * ith;
+
+    const int64_t nr1 = ne11 * ne12 * ne13;
+    int idx_row_size = src2->nb[1];
+
+    // Temporary buffer to dequantize one Q4_K row to float
+    float *dequant_buf = (float *)malloc(ne00 * sizeof(float));
+    GGML_ASSERT(dequant_buf != NULL);
+
+    // Accumulation buffer
+    float *acc_buf = (float *)malloc(ne00 * sizeof(float));
+    GGML_ASSERT(acc_buf != NULL);
+
+    char *src0_row = (char *)src0->data;
+
+    for (int col_idx = 0; col_idx < nr1; col_idx++) {
+        float *src1_col = (float *)((char *)src1->data + col_idx * nb11);
+        float *sparse_idx_col = (float *)((char *)src2->data + col_idx * idx_row_size);
+        float *dst_col = (float *)((char *)dst->data + col_idx * nb1);
+
+        memset(acc_buf, 0, ne00 * sizeof(float));
+
+        for (int64_t ir1 = ir10; ir1 < ir10 + dr; ir1++) {
+            if (ir1 >= nr) break;
+
+            // [UMA-FIX] Skip hot neurons based on gpu_idx (respects ggml_axpy_skip_gpu_idx)
+            extern bool ggml_axpy_skip_gpu_idx;
+            if (ggml_axpy_skip_gpu_idx && gid && gid[ir1] == 1) continue;
+
+            if (sparse_idx_col[ir1] < threshold) continue;
+
+            // Get activation value for this neuron
+            float activation = src1_col[ir1];
+            if (activation == 0.0f) continue;
+
+            // Dequantize the Q4_K weight row to float
+            dequantize_row_q4_K(
+                (const block_q4_K *)(src0_row + nb01 * ir1),
+                dequant_buf, ne00);
+
+            // Accumulate: acc_buf += activation * dequant_buf
+            for (int64_t j = 0; j < ne00; j++) {
+                acc_buf[j] += activation * dequant_buf[j];
+            }
+        }
+
+        // Add accumulated results to dst
+        for (int64_t j = 0; j < ne00; j++) {
+            dst_col[j] += acc_buf[j];
+        }
+    }
+
+    free(dequant_buf);
+    free(acc_buf);
+
+}
+
 atomic_flag g_axpy_head_lock = ATOMIC_FLAG_INIT;
 static void ggml_compute_forward_mul_mat_axpy_head(
         const struct ggml_compute_params * params,
@@ -14783,6 +14890,126 @@ static void ggml_ensure_tensor_data_at_memory(struct ggml_tensor * tensor) {
 #endif
 }
 
+// [CPU-TIMING] Per-op wall clock timing. Activated by CPU_TIMING=1.
+// Aggregates by op type and prints totals on token boundaries.
+int64_t cpu_timing_total_us[GGML_OP_COUNT] = {0};
+int64_t cpu_timing_count[GGML_OP_COUNT] = {0};
+static int cpu_timing_token = 0;
+
+void cpu_timing_print_and_reset(void) {
+    if (!getenv("CPU_TIMING")) return;
+    int64_t total = 0;
+    for (int i = 0; i < GGML_OP_COUNT; i++) total += cpu_timing_total_us[i];
+    fprintf(stderr, "[CPU-TIMING token %d] total=%lld us", cpu_timing_token, (long long)total);
+    // Print top contributors
+    const struct { const char * name; enum ggml_op op; } watch[] = {
+        {"MUL_MAT", GGML_OP_MUL_MAT},
+        {"MUL_MAT_SPARSE", GGML_OP_MUL_MAT_SPARSE},
+        {"AXPY", GGML_OP_AXPY},
+        {"RMS_NORM", GGML_OP_RMS_NORM},
+        {"MUL", GGML_OP_MUL},
+        {"ADD", GGML_OP_ADD},
+        {"SOFT_MAX", GGML_OP_SOFT_MAX},
+        {"ROPE", GGML_OP_ROPE},
+        {"UNARY", GGML_OP_UNARY},
+    };
+    for (size_t i = 0; i < sizeof(watch)/sizeof(watch[0]); i++) {
+        if (cpu_timing_total_us[watch[i].op] > 0) {
+            fprintf(stderr, " | %s=%lld us (%lld)", watch[i].name,
+                    (long long)cpu_timing_total_us[watch[i].op],
+                    (long long)cpu_timing_count[watch[i].op]);
+        }
+    }
+    fprintf(stderr, "\n");
+    for (int i = 0; i < GGML_OP_COUNT; i++) { cpu_timing_total_us[i] = 0; cpu_timing_count[i] = 0; }
+    cpu_timing_token++;
+}
+
+// [OP_DBG] Per-op output capture hook.
+// Activated by env var OP_DBG=<label>. Appends one line per op to
+// /tmp/op_dbg_<label>.txt: capture_idx<TAB>op_name<TAB>name<TAB>ne0<TAB>ne1<TAB>type<TAB>v0..v7
+// capture_idx ignored - we always use a monotonic counter internally.
+static int g_op_dbg_counter = 0;
+void ggml_op_dbg_capture(struct ggml_tensor * node, int node_n) {
+    (void)node_n;  // ignored - use monotonic counter
+    int counter = g_op_dbg_counter++;
+    const char * label = getenv("OP_DBG");
+    if (!label || !node) return;
+    static FILE * fp = NULL;
+    static char last_label[64] = "";
+    if (!fp || strncmp(last_label, label, sizeof(last_label)) != 0) {
+        if (fp) fclose(fp);
+        char path[256];
+        snprintf(path, sizeof(path), "/tmp/op_dbg_%s.txt", label);
+        fp = fopen(path, "w");
+        strncpy(last_label, label, sizeof(last_label) - 1);
+        if (!fp) return;
+        fprintf(stderr, "[OP_DBG] writing to %s\n", path);
+    }
+    if (!fp) return;
+    if (!node->data) {
+        fprintf(fp, "%d\t%s\t%s\t%lld\t%lld\t%s\tNO_DATA\n",
+                counter, ggml_op_name(node->op), node->name[0] ? node->name : "?",
+                (long long)node->ne[0], (long long)node->ne[1],
+                ggml_type_name(node->type));
+        return;
+    }
+    // Extract first 4 values from batch position 0 and batch position 1 (if exists)
+    // This detects batch collapse bugs.
+    float v0[4] = {0};
+    float v1[4] = {0};
+    const int n = 4;
+    const int64_t ne0 = node->ne[0];
+    const int64_t ne1 = node->ne[1];
+    const size_t nb1 = node->nb[1];
+
+    // Also compute full-vector L2 norm and count of non-zero entries for the node.
+    // This gives a coarse fingerprint usable across CPU/GPU comparison.
+    float l2_b0 = 0.0f, l2_b1 = 0.0f;
+    int   nz_b0 = 0,    nz_b1 = 0;
+    if (node->type == GGML_TYPE_F32) {
+        const float * d = (const float *)node->data;
+        for (int k = 0; k < n && k < ne0; k++) v0[k] = d[k];
+        for (int64_t k = 0; k < ne0; k++) { float x = d[k]; l2_b0 += x*x; if (x != 0.0f) nz_b0++; }
+        if (ne1 >= 2) {
+            const float * d2 = (const float *)((const char *)node->data + nb1);
+            for (int k = 0; k < n && k < ne0; k++) v1[k] = d2[k];
+            for (int64_t k = 0; k < ne0; k++) { float x = d2[k]; l2_b1 += x*x; if (x != 0.0f) nz_b1++; }
+        }
+    } else if (node->type == GGML_TYPE_F16) {
+        const ggml_fp16_t * d = (const ggml_fp16_t *)node->data;
+        for (int k = 0; k < n && k < ne0; k++) v0[k] = GGML_FP16_TO_FP32(d[k]);
+        for (int64_t k = 0; k < ne0; k++) { float x = GGML_FP16_TO_FP32(d[k]); l2_b0 += x*x; if (x != 0.0f) nz_b0++; }
+        if (ne1 >= 2) {
+            const ggml_fp16_t * d2 = (const ggml_fp16_t *)((const char *)node->data + nb1);
+            for (int k = 0; k < n && k < ne0; k++) v1[k] = GGML_FP16_TO_FP32(d2[k]);
+            for (int64_t k = 0; k < ne0; k++) { float x = GGML_FP16_TO_FP32(d2[k]); l2_b1 += x*x; if (x != 0.0f) nz_b1++; }
+        }
+    } else if (node->type == GGML_TYPE_I32) {
+        const int32_t * d = (const int32_t *)node->data;
+        for (int k = 0; k < n && k < ne0; k++) v0[k] = (float)d[k];
+        if (ne1 >= 2) {
+            const int32_t * d2 = (const int32_t *)((const char *)node->data + nb1);
+            for (int k = 0; k < n && k < ne0; k++) v1[k] = (float)d2[k];
+        }
+    } else {
+        fprintf(fp, "%d\t%s\t%s\t%lld\t%lld\t%s\tQUANTIZED\n",
+                counter, ggml_op_name(node->op), node->name[0] ? node->name : "?",
+                (long long)ne0, (long long)ne1, ggml_type_name(node->type));
+        return;
+    }
+    fprintf(fp, "%d\t%s\t%s\t%lld\t%lld\t%s",
+            counter, ggml_op_name(node->op), node->name[0] ? node->name : "?",
+            (long long)ne0, (long long)ne1, ggml_type_name(node->type));
+    // b0_v0 b0_v1 b0_v2 b0_v3 | b1_v0 b1_v1 b1_v2 b1_v3 | l2_b0 nz_b0 l2_b1 nz_b1
+    for (int k = 0; k < 4; k++) fprintf(fp, "\t%.6f", v0[k]);
+    fprintf(fp, "\t|");
+    for (int k = 0; k < 4; k++) fprintf(fp, "\t%.6f", v1[k]);
+    fprintf(fp, "\tL2:\t%.4f\t%d\t%.4f\t%d", l2_b0, nz_b0, l2_b1, nz_b1);
+    fprintf(fp, "\n");
+    fflush(fp);
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -14917,12 +15144,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ASSERT(tensor->src[2] != NULL && "sparse index is required for AXPY");
                 struct ggml_tensor *src3 = tensor->src[3];
                 if (src3 != NULL){
-                    if (tensor->src[0]->type != GGML_TYPE_Q4_0) {
-                        ggml_compute_forward_mul_mat_axpy(params, tensor->src[0], tensor->src[1], tensor);
-                    }
-                    else {
+                    if (tensor->src[0]->type == GGML_TYPE_Q4_0) {
                         ggml_compute_forward_mul_mat_axpy_q4_0(params, tensor->src[0], tensor->src[1], tensor);
-
+                    } else if (tensor->src[0]->type == GGML_TYPE_Q4_K) {
+                        // [Q4_K-FIX] Use dedicated Q4_K AXPY with dequantize-then-accumulate
+                        ggml_compute_forward_mul_mat_axpy_q4_K(params, tensor->src[0], tensor->src[1], tensor);
+                    } else {
+                        // F16 and other types — existing path
+                        ggml_compute_forward_mul_mat_axpy(params, tensor->src[0], tensor->src[1], tensor);
                     }
                 } else {
                     ggml_compute_forward_mul_mat_axpy_head(params, tensor->src[0], tensor->src[1], tensor);
@@ -16896,6 +17125,25 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     params.nth = ggml_get_n_tasks(node, n_threads);
                     ggml_compute_forward(&params, node);
                 }
+                // [CPU-TIMING] Record multi-threaded op completion time.
+                // perf_node_start_time_us is only populated when GGML_PERF is defined.
+                // Guard against 0 to avoid nonsense deltas.
+                if (getenv("CPU_TIMING") && state->ith == 0) {
+                    int64_t _node_end = ggml_time_us();
+                    int64_t _node_start = state->shared->perf_node_start_time_us;
+                    if (_node_start > 0 && _node_end > _node_start) {
+                        cpu_timing_total_us[node->op] += (_node_end - _node_start);
+                        cpu_timing_count[node->op]++;
+                    }
+                }
+                // [OP_DBG] Capture per-op output when OP_DBG env var is set.
+                // This block runs under the n_active==1 branch (single finalizer
+                // thread) so no concurrent captures from other threads.
+                if (state->ith == 0) {
+                    extern void ggml_op_dbg_capture(struct ggml_tensor * node, int node_n);
+                    static int dbg_mono_counter = 0;
+                    ggml_op_dbg_capture(node, dbg_mono_counter++);
+                }
                 ggml_graph_compute_perf_stats_node(node, state->shared);
             }
 
@@ -16920,12 +17168,24 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 if (n_tasks == 1) {
                     // TODO: maybe push node_n to the atomic but if other threads see n_tasks is 1,
                     // they do something more efficient than spinning (?)
+                    int64_t _t0 = getenv("CPU_TIMING") ? ggml_time_us() : 0;
                     params.type = GGML_TASK_COMPUTE;
                     ggml_compute_forward(&params, node);
 
                     if (GGML_OP_HAS_FINALIZE[node->op]) {
                         params.type = GGML_TASK_FINALIZE;
                         ggml_compute_forward(&params, node);
+                    }
+                    if (getenv("CPU_TIMING") && state->ith == 0) {
+                        cpu_timing_total_us[node->op] += ggml_time_us() - _t0;
+                        cpu_timing_count[node->op]++;
+                    }
+
+                    // [OP_DBG] Capture single-threaded op output
+                    if (state->ith == 0) {
+                        extern void ggml_op_dbg_capture(struct ggml_tensor * node, int node_n);
+                        static int dbg_mono_counter2 = 0;
+                        ggml_op_dbg_capture(node, dbg_mono_counter2++);
                     }
 
                     ggml_graph_compute_perf_stats_node(node, state->shared);

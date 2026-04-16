@@ -785,6 +785,39 @@ static int8_t llama_rope_scaling_type_from_string(const std::string &name) {
 // ggml helpers
 //
 
+// [DBG] Dump ONLY the final logits tensor for CPU-vs-GPU divergence check.
+// Enable with GRAPH_DUMP=<prefix>  (writes to /tmp/graph_<prefix>.txt).
+// Intermediate tensors are unreliable because ggml's allocator reuses buffers
+// between ops, so by the time compute finishes, intermediate tensors' memory
+// has been overwritten by later ops.
+static void llama_graph_dump_named(const char *prefix, struct ggml_cgraph *gf) {
+    const char *env = getenv("GRAPH_DUMP");
+    if (!env) return;
+    static FILE *fp = NULL;
+    if (!fp) {
+        char path[256];
+        snprintf(path, sizeof(path), "/tmp/graph_%s.txt", env);
+        fp = fopen(path, "w");
+        if (!fp) return;
+        fprintf(stderr, "[GRAPH_DUMP] writing to %s\n", path);
+    }
+    // Final output tensor is the last node (result_output / lm_head)
+    if (gf->n_nodes > 0) {
+        struct ggml_tensor *t = gf->nodes[gf->n_nodes - 1];
+        if (t->data && t->type == GGML_TYPE_F32) {
+            float *d = (float *)t->data;
+            fprintf(fp, "%s\t%lld\t%lld", t->name[0] ? t->name : "unnamed",
+                    t->ne[0], t->ne[1]);
+            int n_print = 16;
+            for (int k = 0; k < n_print && k < t->ne[0]; k++) {
+                fprintf(fp, "\t%.6f", d[k]);
+            }
+            fprintf(fp, "\n");
+        }
+    }
+    fflush(fp);
+}
+
 static void ggml_graph_compute_helper(std::vector<uint8_t> &buf,
                                       ggml_cgraph *graph, int n_threads) {
   struct ggml_cplan plan = ggml_graph_plan(graph, n_threads);
@@ -3581,9 +3614,7 @@ static bool llm_load_gpu_split_with_budget(llama_model_loader &ml,
 #if defined(_WIN32)
   command_ss << "python -m powerinfer"
 #else
-  // [UMA-FIX] Use miniconda python3 which has powerinfer module installed
-  // command_ss << "python3 -m powerinfer"
-  command_ss << "/Users/deeveshizm/miniconda3/bin/python3 -m powerinfer"
+  command_ss << "python3 -m powerinfer"
 #endif
              << " --activation " << activation_path << " --layer "
              << model.hparams.n_layer << " --neuron " << ffn_up->ne[1]
@@ -5332,13 +5363,12 @@ static struct ggml_tensor *llm_build_sparse_mul_mat(
     return out;
   }
 #elif defined(GGML_USE_METAL)
-  // [UMA-FIX BP7] On Metal UMA, use FULL tensor with sparse threshold filtering.
-  // The sparse kernel skips inactive neurons (sparse_idx[row] < threshold).
-  // Only ~10% of rows are actually computed — the rest are cheap comparisons.
-  // No hot/cold split needed: UMA shared memory means no data transfer cost.
-  // Pass NULL for gpu_index so kernel doesn't filter by hot/cold assignment.
+  // [UMA-FIX] On Metal UMA, pass gpu_index to enable hot/cold row partitioning
+  // for true FFN parallelism (UMA_FULL_PARALLEL mode). When gpu_index is NULL
+  // or the full_ffn_parallel flag is not set, the kernel processes all rows
+  // that pass the sparse threshold — backward compatible with existing modes.
   {
-    out = ggml_mul_mat_idx(ctx, up, inp, idx, NULL);
+    out = ggml_mul_mat_idx(ctx, up, inp, idx, gpu_index);
     cb(out, (full_name).c_str());
     return out;
   }
@@ -7665,6 +7695,23 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
   bool uma_force_cpu = (getenv("UMA_CPU_ONLY") != NULL && getenv("UMA_CPU_ONLY")[0] == '1');
   bool uma_parallel  = (getenv("UMA_PARALLEL") != NULL && getenv("UMA_PARALLEL")[0] == '1');
   bool uma_gpu_axpy  = (getenv("UMA_GPU_AXPY") != NULL && getenv("UMA_GPU_AXPY")[0] == '1');
+  bool uma_full_parallel = (getenv("UMA_FULL_PARALLEL") != NULL && getenv("UMA_FULL_PARALLEL")[0] == '1');
+  bool uma_gpu_offload   = (getenv("UMA_GPU_OFFLOAD") != NULL && getenv("UMA_GPU_OFFLOAD")[0] == '1');
+  bool uma_debug_timing  = (getenv("UMA_DEBUG_TIMING") != NULL && getenv("UMA_DEBUG_TIMING")[0] == '1');
+
+  // Per-token timing accumulators (printed every N tokens)
+  static int64_t dbg_metal_dense_us = 0;   // Metal: attention/norms
+  static int64_t dbg_metal_sparse_us = 0;  // Metal: MUL_MAT_SPARSE/UNARY/MUL
+  static int64_t dbg_cpu_sparse_us = 0;    // CPU: MUL_MAT_SPARSE
+  static int64_t dbg_cpu_axpy_us = 0;      // CPU: AXPY
+  static int64_t dbg_cpu_post_us = 0;      // CPU: post-AXPY (ADD/residual)
+  static int dbg_token_count = 0;
+  // GPU ratio for full parallel mode: fraction of neurons handled by Metal (default 0.75)
+  float uma_gpu_ratio = 0.75f;
+  if (getenv("UMA_GPU_RATIO")) {
+    uma_gpu_ratio = atof(getenv("UMA_GPU_RATIO"));
+    if (uma_gpu_ratio < 0.0f || uma_gpu_ratio > 1.0f) uma_gpu_ratio = 0.75f;
+  }
 
   if (lctx.ctx_metal && llama_use_sparse_inference(&model) && !uma_force_cpu) {
     // [UMA-FIX] Per-layer execution for sparse inference on UMA.
@@ -7699,9 +7746,28 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
       }
     }
 
+    if (getenv("OP_DBG")) {
+        for (size_t ri = 0; ri < ranges.size(); ri++) {
+            fprintf(stderr, "[RANGES] %zu: [%d, %d) layer_id=%d\n",
+                    ri, ranges[ri].start, ranges[ri].end, ranges[ri].layer_id);
+        }
+        fprintf(stderr, "[RANGES] n_nodes=%d, last range end=%d\n",
+                gf->n_nodes, ranges.empty() ? -1 : ranges.back().end);
+        for (int i = gf->n_nodes - 10; i < gf->n_nodes; i++) {
+            struct ggml_tensor * n = gf->nodes[i];
+            fprintf(stderr, "[LAST-NODES] %d: op=%s name=%s layer_id=%d\n",
+                    i, ggml_op_name(n->op), n->name[0] ? n->name : "?", n->layer_id);
+        }
+    }
+
     static bool uma_mode_printed = false;
     if (!uma_mode_printed) {
-      if (uma_parallel) {
+      if (uma_gpu_offload) {
+        fprintf(stderr, "[UMA] GPU OFFLOAD mode: Metal handles dense + MUL_MAT_SPARSE, CPU handles AXPY\n");
+      } else if (uma_full_parallel) {
+        fprintf(stderr, "[UMA] FULL PARALLEL mode: GPU %.0f%% + CPU %.0f%% for MUL_MAT_SPARSE\n",
+                uma_gpu_ratio * 100, (1.0f - uma_gpu_ratio) * 100);
+      } else if (uma_parallel) {
         fprintf(stderr, "[UMA] PARALLEL mode: GPU hot AXPY + CPU cold AXPY\n");
       } else if (uma_gpu_axpy) {
         fprintf(stderr, "[UMA] SEQUENTIAL mode: GPU AXPY all neurons\n");
@@ -7722,13 +7788,188 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
         }
       }
 
+      if (uma_gpu_offload) {
+        // When no sparse ops, just run dense ops on Metal
+        if (first_sparse >= r.end) {
+          if (r.end > r.start) {
+            ggml_metal_graph_compute_layer(lctx.ctx_metal, gf, r.start, r.end);
+          }
+        } else if (first_sparse < r.end) {
+        // ============================================================
+        // GPU OFFLOAD MODE: Metal handles everything.
+        // Two Metal dispatches per layer:
+        //   1. Metal: attention + norms + MUL_MAT_SPARSE + UNARY + MUL
+        //      (produces sparse_idx needed for active row filtering)
+        //   2. Metal: AXPY with pre-filtered active rows
+        // CPU: only post-AXPY ops (ADD/residual)
+        // ============================================================
+
+        int last_axpy = -1;
+        for (int i = first_sparse; i < r.end; i++) {
+          if (gf->nodes[i]->op == GGML_OP_AXPY) last_axpy = i;
+        }
+
+        // Dispatch 1: Metal runs everything up to AXPY
+        int pre_axpy_end = (last_axpy >= 0) ? last_axpy : r.end;
+        if (pre_axpy_end > r.start) {
+          int64_t t_metal = uma_debug_timing ? ggml_time_us() : 0;
+          ggml_metal_set_skip_sparse(false);
+          ggml_metal_graph_compute_layer(lctx.ctx_metal, gf, r.start, pre_axpy_end);
+          ggml_metal_set_skip_sparse(true);
+          if (uma_debug_timing) {
+            dbg_metal_dense_us += ggml_time_us() - t_metal;
+          }
+        }
+
+        // Dispatch 2: Metal AXPY with pre-filtered active rows
+        if (last_axpy >= 0) {
+          int64_t t_axpy = uma_debug_timing ? ggml_time_us() : 0;
+          ggml_metal_set_skip_sparse(false);
+          ggml_metal_graph_compute_layer(lctx.ctx_metal, gf, last_axpy, last_axpy + 1);
+          ggml_metal_set_skip_sparse(true);
+          if (uma_debug_timing) {
+            dbg_cpu_axpy_us += ggml_time_us() - t_axpy;
+          }
+        }
+
+        // CPU: post-AXPY ops only (ADD/residual)
+        int post_start = (last_axpy >= 0) ? last_axpy + 1 : r.end;
+        if (post_start < r.end) {
+          int64_t t_post = uma_debug_timing ? ggml_time_us() : 0;
+          ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                         post_start, r.end, n_threads);
+          if (uma_debug_timing) {
+            dbg_cpu_post_us += ggml_time_us() - t_post;
+          }
+        }
+        }  // end else if (first_sparse < r.end)
+
+      } else {
+
+      // All other modes: Metal handles dense ops first, then sparse differently
       // Phase 1: Metal executes dense ops BEFORE the first sparse op
-      // (attention, norms, KV store, FFN predictor)
       if (first_sparse > r.start) {
+        int64_t t_dense = uma_debug_timing ? ggml_time_us() : 0;
         ggml_metal_graph_compute_layer(lctx.ctx_metal, gf, r.start, first_sparse);
+        if (uma_debug_timing) {
+          dbg_metal_dense_us += ggml_time_us() - t_dense;
+        }
       }
 
-      if (uma_parallel && first_sparse < r.end) {
+      if (uma_full_parallel && first_sparse < r.end) {
+        // ============================================================
+        // FULL PARALLEL MODE: GPU + CPU split MUL_MAT_SPARSE
+        // Phase 2a: Metal MUL_MAT_SPARSE (hot rows) || CPU MUL_MAT_SPARSE (cold rows)
+        // Phase 2b: CPU element-wise ops (UNARY/ReLU, MUL) — cheap, sequential
+        // Phase 2c: CPU AXPY (all neurons — Metal can't do Q4_K AXPY yet)
+        // Phase 3:  CPU post-AXPY (ADD/residual)
+        // ============================================================
+
+        // Override gpu_idx for this layer based on uma_gpu_ratio.
+        // Mark top N% of neurons as hot (gpu_idx=1), rest as cold (gpu_idx=0).
+        // This creates a meaningful work split even when the split file has ratio=1.0.
+        // NOTE: gpu_idx tensor data may be mmap'd read-only, so we allocate new memory.
+        static bool gpu_idx_overridden = false;
+        if (!gpu_idx_overridden) {
+          for (int li = 0; li < (int)model.layers.size(); li++) {
+            auto &layer = const_cast<llama_layer &>(model.layers[li]);
+            if (layer.gpu_idx == NULL) continue;
+            int64_t n = layer.gpu_idx->ne[0];
+            int64_t n_hot = (int64_t)(n * uma_gpu_ratio);
+            // Allocate writable copy (original may be mmap'd read-only)
+            int32_t *new_gid = (int32_t *)malloc(n * sizeof(int32_t));
+            for (int64_t j = 0; j < n; j++) {
+              new_gid[j] = (j < n_hot) ? 1 : 0;
+            }
+            layer.gpu_idx->data = new_gid;
+            layer.gpu_offload_ratio = uma_gpu_ratio;
+          }
+          gpu_idx_overridden = true;
+          fprintf(stderr, "[UMA FULL PARALLEL] gpu_idx overridden: %.0f%% hot (GPU), %.0f%% cold (CPU)\n",
+                  uma_gpu_ratio * 100, (1.0f - uma_gpu_ratio) * 100);
+        }
+
+        // Find last MUL_MAT_SPARSE and AXPY in this range
+        int last_mul_mat_sparse = -1;
+        int last_axpy = -1;
+        for (int i = first_sparse; i < r.end; i++) {
+          if (gf->nodes[i]->op == GGML_OP_MUL_MAT_SPARSE) last_mul_mat_sparse = i;
+          if (gf->nodes[i]->op == GGML_OP_AXPY) last_axpy = i;
+        }
+
+        // Phase 2a: Parallel MUL_MAT_SPARSE ops.
+        // RACE FIX: Process each MUL_MAT_SPARSE separately (not as a range that
+        // includes the UNARY between them). The ops between MUL_MAT_SPARSEs
+        // (UNARY/ReLU, MUL) must run sequentially on CPU after each parallel
+        // MUL_MAT_SPARSE completes, otherwise Metal's ReLU sees half-written data.
+        {
+          auto metal_ctx = lctx.ctx_metal;
+          auto metal_gf = gf;
+          int seq_pos = first_sparse;
+          for (int i = first_sparse; i <= last_mul_mat_sparse; i++) {
+            if (gf->nodes[i]->op != GGML_OP_MUL_MAT_SPARSE) continue;
+
+            // Run non-MUL_MAT_SPARSE ops between seq_pos and i sequentially on CPU.
+            if (i > seq_pos) {
+              ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                             seq_pos, i, n_threads);
+            }
+
+            // Parallel dispatch: Metal (hot rows) || CPU (cold rows) for node i
+            ggml_metal_set_skip_sparse(false);
+            ggml_metal_set_full_ffn_parallel(true);
+
+            int node_i = i;
+            std::thread metal_thread([metal_ctx, metal_gf, node_i]() {
+              ggml_metal_graph_compute_layer(metal_ctx, metal_gf,
+                                              node_i, node_i + 1);
+            });
+
+            extern bool ggml_mul_mat_sparse_skip_gpu_idx;
+            ggml_mul_mat_sparse_skip_gpu_idx = true;
+            ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                           i, i + 1, n_threads);
+            ggml_mul_mat_sparse_skip_gpu_idx = false;
+
+            metal_thread.join();
+            ggml_metal_set_full_ffn_parallel(false);
+            ggml_metal_set_skip_sparse(true);
+
+            seq_pos = i + 1;
+          }
+          // Run any remaining sequential ops between last MUL_MAT_SPARSE and last_mul_mat_sparse end
+          if (seq_pos <= last_mul_mat_sparse) {
+            ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                           seq_pos, last_mul_mat_sparse + 1, n_threads);
+          }
+        }
+
+        // Phase 2b: Element-wise ops (UNARY/ReLU, MUL) — CPU only, sequential
+        // These run between MUL_MAT_SPARSE and AXPY
+        int elem_start = (last_mul_mat_sparse >= 0) ? last_mul_mat_sparse + 1 : first_sparse;
+        int elem_end = (last_axpy >= 0) ? last_axpy : r.end;
+        if (elem_end > elem_start) {
+          ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                         elem_start, elem_end, n_threads);
+        }
+
+        // Phase 2c: AXPY — CPU only (Metal can't do Q4_K AXPY)
+        if (last_axpy >= 0) {
+          extern bool ggml_axpy_skip_gpu_idx;
+          ggml_axpy_skip_gpu_idx = false;
+          ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                         last_axpy, last_axpy + 1, n_threads);
+          ggml_axpy_skip_gpu_idx = true;
+        }
+
+        // Phase 3: Post-AXPY ops (ADD/residual)
+        int post_start = (last_axpy >= 0) ? last_axpy + 1 : elem_end;
+        if (post_start < r.end) {
+          ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                         post_start, r.end, n_threads);
+        }
+
+      } else if (uma_parallel && first_sparse < r.end) {
         // ============================================================
         // PARALLEL MODE: GPU (hot neurons) + CPU (cold neurons)
         // Three phases:
@@ -7769,33 +8010,66 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
 
         // Phase 2: Metal AXPY (hot) + CPU AXPY (cold) in parallel
         // Both read from the now-computed activations.
-        auto metal_ctx = lctx.ctx_metal;
-        auto metal_gf = gf;
-        int axpy_start = last_axpy;
-        int axpy_end = last_axpy + 1;
+        // Check if Metal can handle this AXPY weight type
+        bool metal_can_axpy = false;
+        if (last_axpy >= 0 && gf->nodes[last_axpy]->src[0]) {
+          enum ggml_type axpy_type = gf->nodes[last_axpy]->src[0]->type;
+          metal_can_axpy = (axpy_type == GGML_TYPE_F16
+                         || axpy_type == GGML_TYPE_Q4_0
+                         || axpy_type == GGML_TYPE_Q4_K);
+        }
 
-        ggml_metal_set_skip_sparse(false);
-        ggml_metal_set_axpy_only(true);
-        ggml_metal_set_parallel_mode(true);
+        // [UMA_PARALLEL-Q4_K] UMA_PARALLEL assumes:
+        //   1. A meaningful hot/cold split (gpu_offload_ratio < 1.0) so CPU has cold work
+        //   2. Single-batch parallel temp buffer (no batched prompt eval)
+        // Q4_K models typically ship with gpu_offload_ratio=1.0 → CPU skips all rows.
+        // For Q4_K we recommend UMA_GPU_OFFLOAD instead. Fall back to CPU AXPY if Q4_K.
+        if (metal_can_axpy && last_axpy >= 0
+            && gf->nodes[last_axpy]->src[0]->type != GGML_TYPE_Q4_K) {
+          // Metal supports this AXPY type — run GPU+CPU in parallel
+          auto metal_ctx = lctx.ctx_metal;
+          auto metal_gf = gf;
+          int axpy_start = last_axpy;
+          int axpy_end = last_axpy + 1;
 
-        std::thread metal_thread([metal_ctx, metal_gf, axpy_start, axpy_end]() {
-          ggml_metal_graph_compute_layer(metal_ctx, metal_gf,
-                                          axpy_start, axpy_end);
-        });
+          ggml_metal_set_skip_sparse(false);
+          ggml_metal_set_axpy_only(true);
+          ggml_metal_set_parallel_mode(true);
 
-        // CPU AXPY: cold neurons → dst (runs concurrently with Metal)
-        ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
-                                       last_axpy, last_axpy + 1, n_threads);
+          // [A4-FIX] Zero temp buffer on main thread BEFORE launching
+          // parallel threads, so the memset in Metal encoder is a no-op.
+          float *pre_temp = ggml_metal_get_parallel_temp(lctx.ctx_metal);
+          if (pre_temp) {
+            memset(pre_temp, 0, gf->nodes[last_axpy]->ne[0] * sizeof(float));
+          }
 
-        // Wait for Metal thread to finish
-        metal_thread.join();
-        ggml_metal_set_axpy_only(false);
-        ggml_metal_set_skip_sparse(true);
-        ggml_metal_set_parallel_mode(false);
+          std::thread metal_thread([metal_ctx, metal_gf, axpy_start, axpy_end]() {
+            ggml_metal_graph_compute_layer(metal_ctx, metal_gf,
+                                            axpy_start, axpy_end);
+          });
+
+          // CPU AXPY: cold neurons → dst (runs concurrently with Metal)
+          ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                         last_axpy, last_axpy + 1, n_threads);
+
+          // Wait for Metal thread to finish
+          metal_thread.join();
+          ggml_metal_set_axpy_only(false);
+          ggml_metal_set_skip_sparse(true);
+          ggml_metal_set_parallel_mode(false);
+        } else if (last_axpy >= 0) {
+          // Metal can't handle this AXPY type (e.g. Q4_K) — CPU does all AXPY
+          extern bool ggml_axpy_skip_gpu_idx;
+          ggml_axpy_skip_gpu_idx = false;
+          ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
+                                         last_axpy, last_axpy + 1, n_threads);
+          ggml_axpy_skip_gpu_idx = true;
+        }
 
         // Merge: dst += temp (combine hot + cold neuron results)
+        // Only needed when Metal actually ran AXPY (wrote hot neurons to temp)
         float *temp = ggml_metal_get_parallel_temp(lctx.ctx_metal);
-        if (temp && last_axpy >= 0) {
+        if (metal_can_axpy && temp && last_axpy >= 0) {
           float *dst_data = (float *)gf->nodes[last_axpy]->data;
           int64_t ne00 = gf->nodes[last_axpy]->ne[0];
           for (int64_t j = 0; j < ne00; j++) {
@@ -7838,25 +8112,6 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
           ggml_metal_set_axpy_only(false);
           ggml_metal_set_skip_sparse(true);
 
-          // EXPERIMENT: Run CPU AXPY for side effects, then restore Metal result
-          {
-            struct ggml_tensor *axpy_node = gf->nodes[seq_axpy];
-            int64_t ne = axpy_node->ne[0];
-            float *d = (float *)axpy_node->data;
-            float *metal_save = (float *)malloc(ne * sizeof(float));
-            memcpy(metal_save, d, ne * sizeof(float));
-
-            extern bool ggml_axpy_skip_gpu_idx;
-            ggml_axpy_skip_gpu_idx = false;
-            ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
-                                           seq_axpy, seq_axpy + 1, n_threads);
-            ggml_axpy_skip_gpu_idx = true;
-
-            // Restore Metal result — discard CPU values
-            memcpy(d, metal_save, ne * sizeof(float));
-            free(metal_save);
-          }
-
           // Phase 3: CPU processes post-AXPY ops (ADD, etc.)
           if (seq_axpy + 1 < r.end) {
             ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
@@ -7864,13 +8119,38 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
           }
         } else {
           // No AXPY in range or GPU AXPY not enabled — CPU handles everything
+          int64_t t_cpu = uma_debug_timing ? ggml_time_us() : 0;
           extern bool ggml_axpy_skip_gpu_idx;
           ggml_axpy_skip_gpu_idx = false;
           ggml_graph_compute_sparse_cpu(lctx.work_buffer, gf,
                                          first_sparse, r.end, n_threads);
           ggml_axpy_skip_gpu_idx = true;
+          if (uma_debug_timing) {
+            dbg_cpu_sparse_us += ggml_time_us() - t_cpu;
+          }
         }
+      }  // end else (non-GPU_OFFLOAD modes)
+      }  // end if (uma_gpu_offload) / else
+    }
+
+    // Print timing summary every token
+    if (uma_debug_timing) {
+      dbg_token_count++;
+      if (dbg_token_count <= 3 || dbg_token_count % 5 == 0) {
+        int64_t total = dbg_metal_dense_us + dbg_metal_sparse_us + dbg_cpu_sparse_us + dbg_cpu_axpy_us + dbg_cpu_post_us;
+        fprintf(stderr, "[UMA TIMING token %d] Metal(dense+sparse): %.2f ms | CPU(sparse): %.2f ms | CPU(AXPY): %.2f ms | total: %.2f ms\n",
+                dbg_token_count,
+                dbg_metal_dense_us / 1000.0,
+                dbg_cpu_sparse_us / 1000.0,
+                dbg_cpu_axpy_us / 1000.0,
+                total / 1000.0);
       }
+      // Reset per-token
+      dbg_metal_dense_us = 0;
+      dbg_metal_sparse_us = 0;
+      dbg_cpu_sparse_us = 0;
+      dbg_cpu_axpy_us = 0;
+      dbg_cpu_post_us = 0;
     }
   } else if (lctx.ctx_metal && !uma_force_cpu) {
     // Dense model path: unchanged, single Metal dispatch
@@ -7891,6 +8171,14 @@ static int llama_decode_internal(llama_context &lctx, llama_batch batch) {
 #if GGML_USE_MPI
   ggml_mpi_graph_compute_post(lctx.ctx_mpi, gf, n_layer);
 #endif
+
+  // [DBG] Optional: dump named tensor values post-compute (for CPU-vs-GPU diff)
+  llama_graph_dump_named("post_compute", gf);
+
+  // [CPU-TIMING] Per-token CPU op timing breakdown
+  if (getenv("CPU_TIMING")) {
+    cpu_timing_print_and_reset();
+  }
 
   // update the kv ring buffer
   {

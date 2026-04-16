@@ -2249,6 +2249,9 @@ extern "C" {
 
     GGML_API ggml_type_traits_t ggml_internal_get_type_traits(enum ggml_type type);
 
+    // [CPU-TIMING] Debug: prints per-op wall-clock CPU timing for current token then resets.
+    GGML_API void cpu_timing_print_and_reset(void);
+
 #ifdef  __cplusplus
 }
 #endif

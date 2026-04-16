@@ -2946,7 +2946,9 @@ kernel void kernel_mul_mv_q4_K_f32_sparse(
         uint tiisg[[thread_index_in_simdgroup]],
         uint sgitg[[simdgroup_index_in_threadgroup]],
         device const float * sparse_idx [[buffer(18)]],
-        constant float & sparse_threshold [[buffer(19)]]) {
+        constant float & sparse_threshold [[buffer(19)]],
+        device const int * gpu_idx [[buffer(20)]],
+        constant int & has_gpu_idx [[buffer(21)]]) {
 
     const uint16_t kmask1 = 0x3f3f;
     const uint16_t kmask2 = 0x0f0f;
@@ -3000,7 +3002,15 @@ kernel void kernel_mul_mv_q4_K_f32_sparse(
                 dh += step;
                 continue;
             }
-            if (sparse_idx[first_row + row] < sparse_threshold) {
+            // [FFN-PARALLEL] Skip cold neurons — CPU handles them
+            if (has_gpu_idx && gpu_idx[first_row + row] == 0) {
+                q1 += step;
+                sc += step;
+                dh += step;
+                continue;
+            }
+            // [BATCH-FIX] sparse_idx is per-batch: [ne01, ne11]. Row stride ne01.
+            if (sparse_idx[r1 * ne01 + first_row + row] < sparse_threshold) {
                 q1 += step;
                 sc += step;
                 dh += step;
@@ -3043,9 +3053,21 @@ kernel void kernel_mul_mv_q4_K_f32_sparse(
         y4 += 4 * QK_K;
     }
 
+    // [RACE FIX] Only write dst for rows we actually computed. Rows that were
+    // skipped (out of bounds, cold neuron in parallel mode, or below sparse
+    // threshold) must not be written — CPU may be writing them concurrently,
+    // or they should remain at their prior-zeroed value.
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
+            if (first_row + row >= ne01) continue;
+            bool is_cold = (has_gpu_idx && gpu_idx[first_row + row] == 0);
+            bool is_below_thresh = (sparse_idx[r1 * ne01 + first_row + row] < sparse_threshold);
+            if (is_cold) continue;  // CPU is writing this row concurrently — don't touch
+            if (is_below_thresh) {
+                dst[r1*ne0 + r2*ne0*ne1 + first_row + row] = 0.0f;
+                continue;
+            }
             dst[r1*ne0 + r2*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -3067,7 +3089,9 @@ kernel void kernel_mul_mv_q4_K_f32_sparse(
         uint tiisg[[thread_index_in_simdgroup]],
         uint sgitg[[simdgroup_index_in_threadgroup]],
         device const float * sparse_idx [[buffer(18)]],
-        constant float & sparse_threshold [[buffer(19)]]) {
+        constant float & sparse_threshold [[buffer(19)]],
+        device const int * gpu_idx [[buffer(20)]],
+        constant int & has_gpu_idx [[buffer(21)]]) {
 
     const int ix = tiisg/4;  // 0...7
     const int it = tiisg%4;  // 0...3
@@ -3104,7 +3128,15 @@ kernel void kernel_mul_mv_q4_K_f32_sparse(
         device const half     * dh = x[ib].d;
 
         for (int row = 0; row < N_DST; row++) {
-            if (sparse_idx[first_row + row] < sparse_threshold) {
+            // [FFN-PARALLEL] Skip cold neurons — CPU handles them
+            if (has_gpu_idx && gpu_idx[first_row + row] == 0) {
+                qs += step;
+                sc += step;
+                dh += step;
+                continue;
+            }
+            // [BATCH-FIX] sparse_idx is per-batch: [ne01, ne11]. Row stride ne01.
+            if (sparse_idx[r1 * ne01 + first_row + row] < sparse_threshold) {
                 qs += step;
                 sc += step;
                 dh += step;
@@ -3139,9 +3171,18 @@ kernel void kernel_mul_mv_q4_K_f32_sparse(
         y4 += 8 * QK_K;
     }
 
+    // [RACE FIX] Only write dst for rows we actually computed.
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
+            if (first_row + row >= ne01) continue;
+            bool is_cold = (has_gpu_idx && gpu_idx[first_row + row] == 0);
+            bool is_below_thresh = (sparse_idx[r1 * ne01 + first_row + row] < sparse_threshold);
+            if (is_cold) continue;
+            if (is_below_thresh) {
+                dst[r1*ne0+ r2*ne0*ne1 + first_row + row] = 0.0f;
+                continue;
+            }
             dst[r1*ne0+ r2*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -3170,14 +3211,22 @@ kernel void kernel_mul_mv_f16_f32_sparse(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiisg[[thread_index_in_simdgroup]],
         device const float  * sparse_idx [[buffer(18)]],
-        constant     float  & sparse_threshold [[buffer(19)]]) {
+        constant     float  & sparse_threshold [[buffer(19)]],
+        device const int    * gpu_idx [[buffer(20)]],
+        constant     int    & has_gpu_idx [[buffer(21)]]) {
 
     const int64_t r0 = tgpig.x;
     const int64_t r1 = tgpig.y;
     const int64_t im = tgpig.z;
 
-    // Sparse filtering: skip rows below threshold
-    if (sparse_idx[r0] < sparse_threshold) {
+    // [FFN-PARALLEL] Skip cold neurons — CPU handles them
+    if (has_gpu_idx && gpu_idx[r0] == 0) {
+        return;
+    }
+
+    // [BATCH-FIX] sparse_idx is per-batch: [ne01, ne11]. Row stride is ne01.
+    device const float * sparse_idx_b = sparse_idx + r1 * ne01;
+    if (sparse_idx_b[r0] < sparse_threshold) {
         if (tiisg == 0) {
             dst[im*ne1*ne0 + r1*ne0 + r0] = 0.0f;
         }
@@ -3220,33 +3269,40 @@ kernel void kernel_mul_mv_f16_f32_sparse(
 // NOTE: src1 is f32 (not f16) because it comes from MUL_MAT_SPARSE→ReLU→MUL which outputs f32
 kernel void kernel_axpy_f16(
         device const half   * src0       [[buffer(0)]],   // weight matrix (ne00 x ne01), row-major
-        device const float  * src1       [[buffer(1)]],   // activation scalars (ne01) — f32!
-        device       float  * dst        [[buffer(2)]],   // output vector (ne00)
-        device const float  * sparse_idx [[buffer(3)]],   // sparsity predictions (ne01)
-        device const int    * gpu_idx    [[buffer(4)]],   // gpu bucket flags; guarded by has_gpu_idx
-        constant   int64_t  & ne00       [[buffer(5)]],   // number of columns (output dim)
-        constant   int64_t  & ne01       [[buffer(6)]],   // number of rows (input neurons)
+        device const float  * src1       [[buffer(1)]],   // activations (ne01 x ne11), f32
+        device       float  * dst        [[buffer(2)]],   // output (ne00 x ne11), f32
+        device const float  * sparse_idx [[buffer(3)]],   // sparsity predictions (ne01 x ne11)
+        device const int    * gpu_idx    [[buffer(4)]],   // gpu bucket flags (ne01), shared across batch
+        constant   int64_t  & ne00       [[buffer(5)]],   // output dim
+        constant   int64_t  & ne01       [[buffer(6)]],   // input dim (neurons)
         constant   uint64_t & nb01       [[buffer(7)]],   // byte stride per row in src0
-        constant   float    & threshold  [[buffer(8)]],   // sparsity threshold
-        constant   int      & has_gpu_idx [[buffer(9)]],  // whether gpu_idx buffer is valid
-        constant   int      & accumulate [[buffer(10)]],  // 0=overwrite, 1=accumulate (dst += sum)
-        uint tgpig [[threadgroup_position_in_grid]],
-        uint tiisg [[thread_index_in_simdgroup]]) {
+        constant   float    & threshold  [[buffer(8)]],
+        constant   int      & has_gpu_idx [[buffer(9)]],
+        constant   int      & accumulate [[buffer(10)]],
+        constant   int64_t  & ne11       [[buffer(11)]],  // batch size
+        constant   uint64_t & nb11       [[buffer(12)]],  // src1 batch stride (bytes)
+        constant   uint64_t & nb_sparse1 [[buffer(13)]],  // sparse_idx batch stride (bytes)
+        constant   uint64_t & nb1        [[buffer(14)]],  // dst batch stride (bytes)
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        uint  tiisg [[thread_index_in_simdgroup]]) {
 
-    // Each thread handles one column
-    const int col = tgpig * 32 + tiisg;
-    if (col >= ne00) return;
+    // 2D grid: (col_group, batch_idx)
+    const int col = (int)tgpig.x * 32 + (int)tiisg;
+    const int bi  = (int)tgpig.y;
+    if (col >= ne00 || bi >= ne11) return;
+
+    device const float * src1_b       = (device const float *)((device const char *)src1       + bi * nb11);
+    device const float * sparse_idx_b = (device const float *)((device const char *)sparse_idx + bi * nb_sparse1);
+    device       float * dst_b        = (device       float *)((device       char *)dst        + bi * nb1);
 
     float sum = 0.0f;
-
     for (int row = 0; row < ne01; row++) {
-        if (src1[row] == 0.0f) continue;
-        if (sparse_idx[row] < threshold) continue;
+        if (src1_b[row] == 0.0f) continue;
+        if (sparse_idx_b[row] < threshold) continue;
         if (has_gpu_idx && gpu_idx[row] == 0) continue;
 
         // Quantize activation to f16 to match CPU AXPY behavior
-        // (CPU converts src1 to f16 in INIT phase before computation)
-        half act_f16 = (half)src1[row];
+        half act_f16 = (half)src1_b[row];
         float act = (float)act_f16;
 
         device const half * src0_row = (device const half *)((device const char *)src0 + row * nb01);
@@ -3254,62 +3310,169 @@ kernel void kernel_axpy_f16(
     }
 
     if (accumulate) {
-        dst[col] += sum;
+        dst_b[col] += sum;
     } else {
-        dst[col] = sum;
+        dst_b[col] = sum;
     }
 }
 
 // Q4_0 quantized weight variant
 // Q4_0 block: 32 values packed as 16 bytes (4-bit) + 1 f16 scale = 18 bytes per block
 kernel void kernel_axpy_q4_0(
-        device const char   * src0       [[buffer(0)]],   // weight matrix, Q4_0 quantized
-        device const float  * src1       [[buffer(1)]],   // activation scalars (f32)
-        device       float  * dst        [[buffer(2)]],   // output vector (f32)
-        device const float  * sparse_idx [[buffer(3)]],   // sparsity predictions
-        device const int    * gpu_idx    [[buffer(4)]],   // gpu bucket flags
-        constant   int64_t  & ne00       [[buffer(5)]],   // number of columns
-        constant   int64_t  & ne01       [[buffer(6)]],   // number of rows
-        constant   uint64_t & nb01       [[buffer(7)]],   // byte stride per row
-        constant   float    & threshold  [[buffer(8)]],   // sparsity threshold
-        constant   int      & has_gpu_idx [[buffer(9)]],  // whether gpu_idx is valid
-        constant   int      & accumulate [[buffer(10)]],  // 0=overwrite, 1=accumulate
-        uint tgpig [[threadgroup_position_in_grid]],
-        uint tiisg [[thread_index_in_simdgroup]]) {
+        device const char   * src0       [[buffer(0)]],
+        device const float  * src1       [[buffer(1)]],
+        device       float  * dst        [[buffer(2)]],
+        device const float  * sparse_idx [[buffer(3)]],
+        device const int    * gpu_idx    [[buffer(4)]],
+        constant   int64_t  & ne00       [[buffer(5)]],
+        constant   int64_t  & ne01       [[buffer(6)]],
+        constant   uint64_t & nb01       [[buffer(7)]],
+        constant   float    & threshold  [[buffer(8)]],
+        constant   int      & has_gpu_idx [[buffer(9)]],
+        constant   int      & accumulate [[buffer(10)]],
+        constant   int64_t  & ne11       [[buffer(11)]],
+        constant   uint64_t & nb11       [[buffer(12)]],
+        constant   uint64_t & nb_sparse1 [[buffer(13)]],
+        constant   uint64_t & nb1        [[buffer(14)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        uint  tiisg [[thread_index_in_simdgroup]]) {
 
-    const int col = tgpig * 32 + tiisg;
-    if (col >= ne00) return;
+    const int col = (int)tgpig.x * 32 + (int)tiisg;
+    const int bi  = (int)tgpig.y;
+    if (col >= ne00 || bi >= ne11) return;
 
     const int block_idx = col / 32;
     const int in_block  = col % 32;
-    // Q4_0 layout: low nibbles → positions 0–15, high nibbles → positions 16–31
     const int quant_byte = (in_block < 16) ? in_block : (in_block - 16);
     const int quant_nib  = (in_block < 16) ? 0 : 1;
 
-    float sum = 0.0f;
+    device const float * src1_b       = (device const float *)((device const char *)src1       + bi * nb11);
+    device const float * sparse_idx_b = (device const float *)((device const char *)sparse_idx + bi * nb_sparse1);
+    device       float * dst_b        = (device       float *)((device       char *)dst        + bi * nb1);
 
+    float sum = 0.0f;
     for (int row = 0; row < ne01; row++) {
-        if (src1[row] == 0.0f) continue;
-        if (sparse_idx[row] < threshold) continue;
+        if (src1_b[row] == 0.0f) continue;
+        if (sparse_idx_b[row] < threshold) continue;
         if (has_gpu_idx && gpu_idx[row] == 0) continue;
 
         device const char * row_data = src0 + row * nb01;
-
-        // Each Q4_0 block: 2 bytes (f16 scale) + 16 bytes (32 x 4-bit quants)
         device const half * scale_ptr = (device const half *)(row_data + block_idx * 18);
         device const uint8_t * quants = (device const uint8_t *)(row_data + block_idx * 18 + 2);
 
         float scale = (float)(*scale_ptr);
         uint8_t qbyte = quants[quant_byte];
         int qval = (quant_nib == 0) ? (qbyte & 0x0F) : (qbyte >> 4);
-        float weight = scale * ((float)qval - 8.0f);  // Q4_0 offset = 8
+        float weight = scale * ((float)qval - 8.0f);
 
-        sum += src1[row] * weight;
+        sum += src1_b[row] * weight;
     }
 
     if (accumulate) {
-        dst[col] += sum;
+        dst_b[col] += sum;
     } else {
-        dst[col] = sum;
+        dst_b[col] = sum;
+    }
+}
+
+// Q4_K AXPY — 2D-tiled (column × row-chunk) for high Apple-GPU occupancy.
+//
+// Apple GPU requires 24+ simdgroups per core for optimal latency hiding
+// (per Apple's metal-benchmarks microarchitecture data). With 16 cores on
+// M1 Pro, that's 384+ simdgroups total. A column-only kernel launches just
+// 128 simdgroups (ne00/32) — 3x below the threshold → high instruction
+// latency (6.6 vs 1.0 cycles for F32 ops).
+//
+// This kernel adds a second dispatch dimension: row-chunks. Each
+// threadgroup processes (32 cols) × (rows_per_chunk active rows) and
+// atomically accumulates its partial sum into dst.
+//
+// With n_row_chunks=16, we get 128*16=2048 simdgroups (128/core) — well
+// above the 24 threshold. Atomic contention is bounded to n_row_chunks=16
+// atomics per column (not n_active = 1100+).
+//
+// Caller must pre-zero the destination buffer.
+kernel void kernel_axpy_q4_K(
+        device const char          * src0           [[buffer(0)]],
+        device const float         * src1           [[buffer(1)]],
+        device       atomic_float  * dst_atomic     [[buffer(2)]],
+        device const int           * active_rows    [[buffer(3)]],
+        constant   int             & n_active       [[buffer(4)]],
+        constant   int64_t         & ne00           [[buffer(5)]],
+        constant   uint64_t        & nb01           [[buffer(6)]],
+        constant   int             & rows_per_chunk [[buffer(7)]],
+        constant   int64_t         & ne11           [[buffer(8)]],
+        constant   uint64_t        & nb11           [[buffer(9)]],
+        constant   uint64_t        & nb1            [[buffer(10)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint  tiisg [[thread_index_in_simdgroup]]) {
+
+    const int col_group = (int)tgpig.x;
+    const int row_chunk = (int)tgpig.y;
+    const int bi        = (int)tgpig.z;
+    const int col = col_group * 32 + tiisg;
+    if (col >= ne00 || bi >= ne11) return;
+
+    // Note: the host builds a separate active_rows list per batch position and
+    // dispatches this kernel once per batch (with bi=0 in the grid). If bi>0
+    // is ever used with a shared active_rows, it'd read the wrong rows.
+    // For safety we index src1 and dst by batch even though the caller uses
+    // bi=0 only (kernel still correct for single-batch dispatches).
+
+    const int row_start = row_chunk * rows_per_chunk;
+    if (row_start >= n_active) return;
+    const int row_end = min(n_active, row_start + rows_per_chunk);
+
+    device const float        * src1_b      = (device const float *)((device const char *)src1 + bi * nb11);
+    device       atomic_float * dst_b       = (device atomic_float *)((device       char *)dst_atomic + bi * nb1);
+
+    // Precompute column layout within Q4_K block (constant across rows)
+    const int block_idx   = col / QK_K;
+    const int pos         = col % QK_K;
+    const int j_group     = pos / 64;
+    const int offset_in_j = pos - j_group * 64;
+    const bool is_low     = (offset_in_j < 32);
+    const int l           = is_low ? offset_in_j : (offset_in_j - 32);
+    const int q_byte_idx  = j_group * 32 + l;
+    const int scale_idx   = j_group * 2 + (is_low ? 0 : 1);
+
+    float sum = 0.0f;
+
+    for (int i = row_start; i < row_end; i++) {
+        const int row = active_rows[i];
+
+        const float act = src1_b[row];
+        if (act == 0.0f) continue;
+
+        device const block_q4_K * blk =
+            (device const block_q4_K *)(src0 + row * nb01) + block_idx;
+
+        const float d    = (float)blk->d;
+        const float dmin = (float)blk->dmin;
+
+        uint sc_val, m_val;
+        if (scale_idx < 4) {
+            sc_val = (uint)(blk->scales[scale_idx] & 63);
+            m_val  = (uint)(blk->scales[scale_idx + 4] & 63);
+        } else {
+            sc_val = (uint)((blk->scales[scale_idx + 4] & 0xF) | ((blk->scales[scale_idx - 4] >> 6) << 4));
+            m_val  = (uint)((blk->scales[scale_idx + 4] >> 4)  | ((blk->scales[scale_idx]     >> 6) << 4));
+        }
+
+        const float d_eff = d * (float)sc_val;
+        const float m_eff = dmin * (float)m_val;
+
+        const uint qbyte = (uint)blk->qs[q_byte_idx];
+        const uint qval  = is_low ? (qbyte & 0xF) : (qbyte >> 4);
+        const float weight = d_eff * (float)qval - m_eff;
+
+        sum += act * weight;
+    }
+
+    // One atomic per thread = 32 atomics per threadgroup.
+    // With n_row_chunks=16, each column gets 16 atomics spread over
+    // different threadgroups/cores — manageable contention.
+    if (sum != 0.0f) {
+        atomic_fetch_add_explicit(&dst_b[col], sum, memory_order_relaxed);
     }
 }

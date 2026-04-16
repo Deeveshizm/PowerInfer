@@ -134,6 +134,7 @@ struct ggml_metal_context {
   GGML_METAL_DECL_KERNEL(mul_mv_f16_f32_sparse);
   GGML_METAL_DECL_KERNEL(axpy_f16);
   GGML_METAL_DECL_KERNEL(axpy_q4_0);
+  GGML_METAL_DECL_KERNEL(axpy_q4_K);
 
 #undef GGML_METAL_DECL_KERNEL
 };
@@ -179,6 +180,14 @@ int64_t ggml_metal_parallel_temp_ne00 = 0;
 
 void ggml_metal_set_parallel_mode(bool parallel) {
     ggml_metal_parallel_mode = parallel;
+}
+
+// [FFN-PARALLEL] When true, Metal processes MUL_MAT_SPARSE with gpu_idx
+// filtering (hot neurons only) for true FFN parallelism.
+bool ggml_metal_full_ffn_parallel = false;
+
+void ggml_metal_set_full_ffn_parallel(bool enable) {
+    ggml_metal_full_ffn_parallel = enable;
 }
 
 void ggml_metal_alloc_parallel_temp(struct ggml_metal_context * ctx, int64_t ne00) {
@@ -403,6 +412,7 @@ struct ggml_metal_context *ggml_metal_init(int n_cb) {
     GGML_METAL_ADD_KERNEL(mul_mv_f16_f32_sparse);
     GGML_METAL_ADD_KERNEL(axpy_f16);
     GGML_METAL_ADD_KERNEL(axpy_q4_0);
+    GGML_METAL_ADD_KERNEL(axpy_q4_K);
     GGML_METAL_ADD_KERNEL(mul_mv_q5_K_f32);
     GGML_METAL_ADD_KERNEL(mul_mv_q6_K_f32);
     if ([ctx->device supportsFamily:MTLGPUFamilyApple7]) {
@@ -1007,8 +1017,13 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
             break;
           case GGML_OP_AXPY:
             if (ggml_metal_skip_sparse_ops) continue;
+            // [FFN-PARALLEL] In full FFN parallel mode, AXPY is handled separately
+            if (ggml_metal_full_ffn_parallel) continue;
             break;
           default:
+            // [FFN-PARALLEL] In full FFN parallel mode, skip element-wise ops (UNARY, MUL)
+            // CPU handles these after the MUL_MAT_SPARSE join
+            if (ggml_metal_full_ffn_parallel) continue;
             // In axpy_only mode, skip all non-AXPY ops
             if (ggml_metal_axpy_only) continue;
             break;
@@ -1998,6 +2013,18 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
                   } else {
                       [encoder setBytes:&ggml_metal_sparse_threshold length:sizeof(ggml_metal_sparse_threshold) atIndex:19];
                   }
+
+                  // [FFN-PARALLEL] Bind gpu_idx for hot/cold neuron partitioning
+                  int has_gpu_idx_sparse = (src3 != NULL && ggml_metal_full_ffn_parallel) ? 1 : 0;
+                  if (has_gpu_idx_sparse) {
+                      size_t offs_src3 = 0;
+                      id<MTLBuffer> id_src3 = ggml_metal_get_buffer(ctx, src3, &offs_src3);
+                      [encoder setBuffer:id_src3 offset:offs_src3 atIndex:20];
+                  } else {
+                      // Bind dummy buffer; has_gpu_idx=0 prevents reads
+                      [encoder setBuffer:id_src0 offset:0 atIndex:20];
+                  }
+                  [encoder setBytes:&has_gpu_idx_sparse length:sizeof(has_gpu_idx_sparse) atIndex:21];
               }
 
               if (src0t == GGML_TYPE_F16) {
@@ -2022,7 +2049,12 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
               struct ggml_tensor *src3_axpy = dst->src[3];
               size_t offs_src3_axpy = 0;
               id<MTLBuffer> id_src3_axpy = src3_axpy ? ggml_metal_get_buffer(ctx, src3_axpy, &offs_src3_axpy) : nil;
-              int has_gpu_idx = (src3_axpy != NULL && !ggml_metal_axpy_all_neurons) ? 1 : 0;
+              // [AXPY-FILTER-FIX] Only apply gpu_idx (hot/cold) filter in parallel mode
+              // where CPU handles the cold neurons. In all other modes (including
+              // GPU_OFFLOAD where Metal must process ALL active neurons), disable it.
+              int has_gpu_idx = (src3_axpy != NULL
+                                 && !ggml_metal_axpy_all_neurons
+                                 && ggml_metal_parallel_mode) ? 1 : 0;
 
               // Select kernel based on weight type
               switch (src0t) {
@@ -2032,51 +2064,167 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
               case GGML_TYPE_Q4_0:
                   [encoder setComputePipelineState:ctx->pipeline_axpy_q4_0];
                   break;
+              case GGML_TYPE_Q4_K:
+                  // Q4_K uses optimized kernel with pre-filtered active rows
+                  break;
               default:
                   GGML_METAL_LOG_ERROR("AXPY: unsupported src0 type %d for Metal\n", (int)src0t);
                   GGML_ASSERT(false && "AXPY type not implemented for Metal");
               }
 
-              [encoder setBuffer:id_src0      offset:offs_src0      atIndex:0];
-              [encoder setBuffer:id_src1      offset:offs_src1      atIndex:1];
-              // [UMA-FIX] In parallel mode, redirect AXPY output to temp buffer
-              // so CPU (cold neurons) and GPU (hot neurons) don't race on dst.
-              if (ggml_metal_parallel_mode && ggml_metal_parallel_temp_mtl) {
-                  memset(ggml_metal_parallel_temp_data, 0, ne00 * sizeof(float));
-                  [encoder setBuffer:ggml_metal_parallel_temp_mtl offset:0 atIndex:2];
-              } else {
-                  [encoder setBuffer:id_dst offset:offs_dst atIndex:2];
-              }
-              [encoder setBuffer:id_src2      offset:offs_src2      atIndex:3];  // sparse_idx
-              if (id_src3_axpy) {
-                  [encoder setBuffer:id_src3_axpy offset:offs_src3_axpy atIndex:4];  // gpu_idx
-              } else {
-                  // Bind dummy buffer; has_gpu_idx=0 prevents reads
-                  [encoder setBuffer:id_src0 offset:0 atIndex:4];
-              }
-              [encoder setBytes:&ne00 length:sizeof(ne00) atIndex:5];
-              [encoder setBytes:&ne01 length:sizeof(ne01) atIndex:6];
-              [encoder setBytes:&nb01 length:sizeof(nb01) atIndex:7];
-              // [UMA-FIX BP7] When gpu_idx is truly NULL (no tensor at all),
-              // all rows are hot — set threshold to -FLT_MAX so all rows pass.
-              // When axpy_all_neurons, gpu_idx exists but we ignore it — still use normal threshold.
-              if (has_gpu_idx == 0 && src3_axpy == NULL) {
-                  float neg_inf = -FLT_MAX;
-                  [encoder setBytes:&neg_inf length:sizeof(neg_inf) atIndex:8];
-              } else {
-                  [encoder setBytes:&ggml_metal_sparse_threshold length:sizeof(ggml_metal_sparse_threshold) atIndex:8];
-              }
-              [encoder setBytes:&has_gpu_idx length:sizeof(has_gpu_idx) atIndex:9];
+              if (src0t == GGML_TYPE_Q4_K) {
+                  // [Q4_K AXPY — batched] For each batch position, build a
+                  // per-batch active rows list (depends on that batch's
+                  // sparse_idx), then dispatch a row-tiled kernel writing to
+                  // dst[batch_i, :]. Separate dispatch per batch position
+                  // because active_rows differs per batch.
+                  float thresh = ggml_metal_sparse_threshold;
+                  int *gpu_idx_data = (src3_axpy && ggml_metal_parallel_mode) ? (int *)src3_axpy->data : NULL;
+                  int local_has_gpu_idx = (gpu_idx_data != NULL) ? 1 : 0;
 
-              // accumulate=0 (overwrite) when Metal is sole AXPY writer (all-neurons mode)
-              // accumulate=1 when Metal needs to add to existing dst (parallel mode after CPU)
-              int accumulate_flag = ggml_metal_parallel_mode ? 1 : 0;
-              [encoder setBytes:&accumulate_flag length:sizeof(accumulate_flag) atIndex:10];
+                  static int *active_rows_buf = NULL;
+                  static int active_rows_cap = 0;
+                  if (active_rows_cap < (int)ne01) {
+                      active_rows_buf = (int *)realloc(active_rows_buf, ne01 * sizeof(int));
+                      active_rows_cap = (int)ne01;
+                  }
 
-              // One threadgroup per 32-column chunk, 32 threads per group (one SIMD group)
-              const int64_t n_threadgroups = (ne00 + 31) / 32;
-              [encoder dispatchThreadgroups:MTLSizeMake(n_threadgroups, 1, 1)
-                      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                  // [BATCH-FIX] One persistent Metal buffer per batch position.
+                  // Previously a single shared buffer caused async reuse bugs where
+                  // later memcpys overwrote earlier dispatches' row lists in flight.
+                  #define MAX_AXPY_BATCH_BUFFERS 64
+                  static id<MTLBuffer> active_rows_mtl_per_batch[MAX_AXPY_BATCH_BUFFERS] = {nil};
+                  static int active_rows_mtl_cap_per_batch[MAX_AXPY_BATCH_BUFFERS] = {0};
+
+                  static int n_row_chunks_cfg = 0;
+                  if (n_row_chunks_cfg == 0) {
+                      const char *env = getenv("Q4K_AXPY_CHUNKS");
+                      n_row_chunks_cfg = env ? atoi(env) : 48;
+                      if (n_row_chunks_cfg < 1) n_row_chunks_cfg = 48;
+                  }
+
+                  // Pre-zero full destination for all batch positions.
+                  const int64_t n_batch = ne11;
+                  const uint64_t nb1_axpy_k = dst ? dst->nb[1] : (ne00 * sizeof(float));
+                  if (ggml_metal_parallel_mode && ggml_metal_parallel_temp_mtl) {
+                      memset(ggml_metal_parallel_temp_data, 0, ne00 * sizeof(float));
+                  } else {
+                      memset((char *)dst->data + offs_dst, 0, n_batch * nb1_axpy_k);
+                  }
+
+                  // Parameters shared across batch dispatches
+                  const int64_t n_col_groups = (ne00 + 31) / 32;
+                  const uint64_t nb11_q4k = src1 ? src1->nb[1] : 0;
+                  const uint64_t nb_sparse1_q4k = src2 ? src2->nb[1] : 0;
+
+                  // Dispatch once per batch position
+                  for (int64_t bi = 0; bi < n_batch; bi++) {
+                      float *sparse_data_b = (float *)((char *)src2->data + bi * nb_sparse1_q4k);
+
+                      // Build active row list for this batch position
+                      int n_active = 0;
+                      for (int row = 0; row < (int)ne01; row++) {
+                          if (sparse_data_b[row] < thresh) continue;
+                          if (local_has_gpu_idx && gpu_idx_data[row] != 1) continue;
+                          active_rows_buf[n_active++] = row;
+                      }
+
+                      if (n_active == 0) continue;
+
+                      // [BATCH-FIX] Use a dedicated buffer for this batch slot so
+                      // kernels launched later in the same command encoder don't
+                      // see an overwritten row list from a later batch.
+                      GGML_ASSERT(bi < MAX_AXPY_BATCH_BUFFERS);
+                      if (n_active > active_rows_mtl_cap_per_batch[bi] || active_rows_mtl_per_batch[bi] == nil) {
+                          int new_cap = n_active * 2;
+                          size_t buf_size = new_cap * sizeof(int);
+                          size_t page_size = sysconf(_SC_PAGESIZE);
+                          buf_size = (buf_size + page_size - 1) & ~(page_size - 1);
+                          active_rows_mtl_per_batch[bi] = [ctx->device newBufferWithLength:buf_size
+                                                             options:MTLResourceStorageModeShared];
+                          active_rows_mtl_cap_per_batch[bi] = new_cap;
+                      }
+                      id<MTLBuffer> active_rows_mtl = active_rows_mtl_per_batch[bi];
+                      memcpy([active_rows_mtl contents], active_rows_buf, n_active * sizeof(int));
+
+                      int n_row_chunks = n_row_chunks_cfg;
+                      int rows_per_chunk = (n_active + n_row_chunks - 1) / n_row_chunks;
+                      if (rows_per_chunk < 1) rows_per_chunk = 1;
+                      n_row_chunks = (n_active + rows_per_chunk - 1) / rows_per_chunk;
+
+                      // Compute per-batch offsets by advancing buffer offsets
+                      const size_t src1_off_b  = offs_src1 + bi * nb11_q4k;
+                      const size_t dst_off_b   = offs_dst  + bi * nb1_axpy_k;
+
+                      [encoder setComputePipelineState:ctx->pipeline_axpy_q4_K];
+                      [encoder setBuffer:id_src0         offset:offs_src0     atIndex:0];
+                      [encoder setBuffer:id_src1         offset:src1_off_b    atIndex:1];
+                      if (ggml_metal_parallel_mode && ggml_metal_parallel_temp_mtl) {
+                          // parallel mode temp buffer: single row (batch=1 fast path).
+                          // NOTE: parallel mode with batch>1 not supported yet.
+                          [encoder setBuffer:ggml_metal_parallel_temp_mtl offset:0 atIndex:2];
+                      } else {
+                          [encoder setBuffer:id_dst offset:dst_off_b atIndex:2];
+                      }
+                      [encoder setBuffer:active_rows_mtl offset:0              atIndex:3];
+                      [encoder setBytes:&n_active        length:sizeof(n_active)        atIndex:4];
+                      [encoder setBytes:&ne00            length:sizeof(ne00)            atIndex:5];
+                      [encoder setBytes:&nb01            length:sizeof(nb01)            atIndex:6];
+                      [encoder setBytes:&rows_per_chunk  length:sizeof(rows_per_chunk)  atIndex:7];
+                      // Batch info unused by kernel when we offset buffers (bi=0 from kernel's POV)
+                      int64_t one_batch = 1;
+                      uint64_t zero_stride = 0;
+                      [encoder setBytes:&one_batch    length:sizeof(one_batch)     atIndex:8];
+                      [encoder setBytes:&zero_stride  length:sizeof(zero_stride)   atIndex:9];
+                      [encoder setBytes:&zero_stride  length:sizeof(zero_stride)   atIndex:10];
+
+                      [encoder dispatchThreadgroups:MTLSizeMake(n_col_groups, n_row_chunks, 1)
+                              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                  }
+              } else {
+                  // F16 / Q4_0 — batched dispatch (2D grid: [col_groups x batch])
+                  [encoder setBuffer:id_src0      offset:offs_src0      atIndex:0];
+                  [encoder setBuffer:id_src1      offset:offs_src1      atIndex:1];
+                  if (ggml_metal_parallel_mode && ggml_metal_parallel_temp_mtl) {
+                      memset(ggml_metal_parallel_temp_data, 0, ne00 * sizeof(float));
+                      [encoder setBuffer:ggml_metal_parallel_temp_mtl offset:0 atIndex:2];
+                  } else {
+                      [encoder setBuffer:id_dst offset:offs_dst atIndex:2];
+                  }
+                  [encoder setBuffer:id_src2      offset:offs_src2      atIndex:3];  // sparse_idx
+                  if (id_src3_axpy) {
+                      [encoder setBuffer:id_src3_axpy offset:offs_src3_axpy atIndex:4];
+                  } else {
+                      [encoder setBuffer:id_src0 offset:0 atIndex:4];
+                  }
+                  [encoder setBytes:&ne00 length:sizeof(ne00) atIndex:5];
+                  [encoder setBytes:&ne01 length:sizeof(ne01) atIndex:6];
+                  [encoder setBytes:&nb01 length:sizeof(nb01) atIndex:7];
+                  if (has_gpu_idx == 0 && src3_axpy == NULL) {
+                      float neg_inf = -FLT_MAX;
+                      [encoder setBytes:&neg_inf length:sizeof(neg_inf) atIndex:8];
+                  } else {
+                      [encoder setBytes:&ggml_metal_sparse_threshold length:sizeof(ggml_metal_sparse_threshold) atIndex:8];
+                  }
+                  [encoder setBytes:&has_gpu_idx length:sizeof(has_gpu_idx) atIndex:9];
+                  int accumulate_flag = ggml_metal_parallel_mode ? 1 : 0;
+                  [encoder setBytes:&accumulate_flag length:sizeof(accumulate_flag) atIndex:10];
+
+                  // [BATCH-FIX] Batch dim info for per-batch-position pointer offsets
+                  int64_t ne11_axpy = ne11;  // batch size (dst->ne[1], src1->ne[1])
+                  uint64_t nb11_axpy = src1 ? src1->nb[1] : 0;
+                  uint64_t nb_sparse1_axpy = src2 ? src2->nb[1] : 0;
+                  uint64_t nb1_axpy = dst ? dst->nb[1] : 0;
+
+                  [encoder setBytes:&ne11_axpy        length:sizeof(ne11_axpy)       atIndex:11];
+                  [encoder setBytes:&nb11_axpy        length:sizeof(nb11_axpy)       atIndex:12];
+                  [encoder setBytes:&nb_sparse1_axpy  length:sizeof(nb_sparse1_axpy) atIndex:13];
+                  [encoder setBytes:&nb1_axpy         length:sizeof(nb1_axpy)        atIndex:14];
+
+                  const int64_t n_threadgroups = (ne00 + 31) / 32;
+                  [encoder dispatchThreadgroups:MTLSizeMake(n_threadgroups, ne11_axpy, 1)
+                          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+              }
           } break;
 
           default: {
@@ -2106,6 +2254,30 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
     for (int i = 0; i < n_cb; i++) {
       [ctx->command_buffers[i] waitUntilCompleted];
 
+      // [PERF-DBG] Report actual GPU execution time (env var METAL_GPU_TIME_DBG)
+      // Total GPU compute time per token aggregated across all command buffers.
+      if (getenv("METAL_GPU_TIME_DBG")) {
+        CFTimeInterval gpu_start = [ctx->command_buffers[i] GPUStartTime];
+        CFTimeInterval gpu_end   = [ctx->command_buffers[i] GPUEndTime];
+        if (gpu_end > gpu_start) {
+          double gpu_ms = (gpu_end - gpu_start) * 1000.0;
+          static double tot_axpy_gpu = 0, tot_sparse_gpu = 0;
+          static int axpy_count = 0, sparse_count = 0;
+          if (gf->n_nodes == 1) { tot_axpy_gpu += gpu_ms; axpy_count++; }
+          else                  { tot_sparse_gpu += gpu_ms; sparse_count++; }
+          static int dbg_cb_count = 0;
+          dbg_cb_count++;
+          if (dbg_cb_count == 64) {
+            fprintf(stderr, "[METAL-TOTAL] pre-AXPY: %.2f ms (%d cbs, avg %.2f) | AXPY: %.2f ms (%d cbs, avg %.2f)\n",
+                    tot_sparse_gpu, sparse_count, tot_sparse_gpu / (sparse_count ?: 1),
+                    tot_axpy_gpu, axpy_count, tot_axpy_gpu / (axpy_count ?: 1));
+            tot_axpy_gpu = tot_sparse_gpu = 0;
+            axpy_count = sparse_count = 0;
+            dbg_cb_count = 0;
+          }
+        }
+      }
+
       MTLCommandBufferStatus status =
           (MTLCommandBufferStatus)[ctx->command_buffers[i] status];
       if (status != MTLCommandBufferStatusCompleted) {
@@ -2130,11 +2302,38 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
 // [UMA-FIX] Per-layer Metal execution for sparse inference on UMA.
 // Processes only nodes in [node_start, node_end), skipping sparse ops.
 // Reuses ggml_metal_graph_compute by creating a lightweight graph view.
+// Forward decl to call into the CPU-side debug capture hook (defined in ggml.c)
+extern void ggml_op_dbg_capture(struct ggml_tensor * node, int node_n);
+
 void ggml_metal_graph_compute_layer(struct ggml_metal_context *ctx,
                                      struct ggml_cgraph *gf,
                                      int node_start,
                                      int node_end) {
   if (node_start >= node_end) return;
+
+  // [OP_DBG] If OP_DBG is set, run one node at a time and capture the
+  // output tensor values before the next op potentially overwrites memory.
+  // This is slow but gives a reliable op-by-op dump for CPU/GPU comparison.
+  if (getenv("OP_DBG")) {
+    for (int i = node_start; i < node_end; i++) {
+      struct ggml_cgraph one = {
+        .size    = 1,
+        .n_nodes = 1,
+        .n_leafs = 0,
+        .nodes   = gf->nodes + i,
+        .grads   = NULL,
+        .leafs   = NULL,
+        .visited_hash_table = { 0, NULL },
+        .perf_runs   = 0,
+        .perf_cycles = 0,
+        .perf_time_us = 0,
+      };
+      ggml_metal_graph_compute(ctx, &one);
+      // Metal has waited on the command buffer by now; output is valid.
+      ggml_op_dbg_capture(gf->nodes[i], i);
+    }
+    return;
+  }
 
   // Create a stack-local graph that views into the original's node array.
   // This reuses the full op dispatch in ggml_metal_graph_compute without
@@ -2213,9 +2412,11 @@ void ggml_metal_graph_compute_async(struct ggml_metal_context *ctx,
         break;
       case GGML_OP_AXPY:
         if (ggml_metal_skip_sparse_ops) continue;
+        if (ggml_metal_full_ffn_parallel) continue;
         break;
       default:
         if (ggml_metal_axpy_only) continue;
+        if (ggml_metal_full_ffn_parallel) continue;
         break;
       }
 
@@ -2236,12 +2437,25 @@ void ggml_metal_graph_compute_async(struct ggml_metal_context *ctx,
       struct ggml_tensor *src3_axpy = dst->src[3];
       size_t offs_src3_axpy = 0;
       id<MTLBuffer> id_src3_axpy = src3_axpy ? ggml_metal_get_buffer(ctx, src3_axpy, &offs_src3_axpy) : nil;
-      int has_gpu_idx = (src3_axpy != NULL && !ggml_metal_axpy_all_neurons) ? 1 : 0;
+      // [AXPY-FILTER-FIX] Only filter cold neurons in parallel mode
+      int has_gpu_idx = (src3_axpy != NULL
+                         && !ggml_metal_axpy_all_neurons
+                         && ggml_metal_parallel_mode) ? 1 : 0;
 
       const enum ggml_type src0t = src0->type;
       const int64_t ne00 = src0->ne[0];
       const int64_t ne01 = src0->ne[1];
+      const int64_t ne11 = src1 ? src1->ne[1] : 1;
       const uint64_t nb01 = src0->nb[1];
+      const uint64_t nb11_axpy = src1 ? src1->nb[1] : 0;
+      const uint64_t nb_sparse1_axpy = (dst && dst->src[2]) ? dst->src[2]->nb[1] : 0;
+      const uint64_t nb1_axpy = dst ? dst->nb[1] : 0;
+
+      // Q4_K uses a different kernel signature (row-tiled with atomics);
+      // the async path doesn't yet have batch support for Q4_K — assert if hit.
+      if (src0t == GGML_TYPE_Q4_K) {
+          GGML_ASSERT(ne11 == 1 && "async Metal path doesn't support batched Q4_K AXPY yet");
+      }
 
       switch (src0t) {
       case GGML_TYPE_F16:
@@ -2249,6 +2463,9 @@ void ggml_metal_graph_compute_async(struct ggml_metal_context *ctx,
         break;
       case GGML_TYPE_Q4_0:
         [encoder setComputePipelineState:ctx->pipeline_axpy_q4_0];
+        break;
+      case GGML_TYPE_Q4_K:
+        [encoder setComputePipelineState:ctx->pipeline_axpy_q4_K];
         break;
       default:
         GGML_ASSERT(false && "AXPY type not implemented for async Metal");
@@ -2282,8 +2499,14 @@ void ggml_metal_graph_compute_async(struct ggml_metal_context *ctx,
       int accumulate_flag = ggml_metal_parallel_mode ? 1 : 0;
       [encoder setBytes:&accumulate_flag length:sizeof(accumulate_flag) atIndex:10];
 
+      // [BATCH-FIX] Pass batch dim info (F16/Q4_0 kernels)
+      [encoder setBytes:&ne11              length:sizeof(ne11)              atIndex:11];
+      [encoder setBytes:&nb11_axpy         length:sizeof(nb11_axpy)         atIndex:12];
+      [encoder setBytes:&nb_sparse1_axpy   length:sizeof(nb_sparse1_axpy)   atIndex:13];
+      [encoder setBytes:&nb1_axpy          length:sizeof(nb1_axpy)          atIndex:14];
+
       const int64_t n_threadgroups = (ne00 + 31) / 32;
-      [encoder dispatchThreadgroups:MTLSizeMake(n_threadgroups, 1, 1)
+      [encoder dispatchThreadgroups:MTLSizeMake(n_threadgroups, ne11, 1)
               threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     }
 
@@ -2373,24 +2596,26 @@ static void ggml_backend_metal_set_tensor_async(ggml_backend_t backend,
               "tensor write out of bounds");
   GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
 
-  // --- UMA OPTIMIZATION PROFILING START ---
-  int64_t t_start = ggml_time_us();
-  
   memcpy((char *)tensor->data + offset, data, size);
 
-  int64_t t_end = ggml_time_us();
-
-  static int64_t total_memcpy_us = 0;
-  static int64_t total_memcpy_bytes = 0;
-  total_memcpy_us += (t_end - t_start);
-  total_memcpy_bytes += size;
-  
-  if (total_memcpy_bytes > 100 * 1024 * 1024) {
-       fprintf(stderr, "\n[UMA BASELINE METAL SET] Accumulated CPU-GPU memcpy overhead: %.2f ms (%.2f MB copied)\n", total_memcpy_us / 1000.0, total_memcpy_bytes / 1024.0 / 1024.0);
-       total_memcpy_bytes = 0;
-       total_memcpy_us = 0;
+#ifdef UMA_DEBUG
+  // --- UMA OPTIMIZATION PROFILING ---
+  {
+    static int64_t total_memcpy_us = 0;
+    static int64_t total_memcpy_bytes = 0;
+    int64_t t_start = ggml_time_us();
+    // memcpy already done above; measure overhead only
+    int64_t t_end = ggml_time_us();
+    total_memcpy_us += (t_end - t_start);
+    total_memcpy_bytes += size;
+    if (total_memcpy_bytes > 100 * 1024 * 1024) {
+      fprintf(stderr, "\n[UMA DEBUG METAL SET] Accumulated CPU-GPU memcpy: %.2f ms (%.2f MB)\n",
+              total_memcpy_us / 1000.0, total_memcpy_bytes / 1024.0 / 1024.0);
+      total_memcpy_bytes = 0;
+      total_memcpy_us = 0;
+    }
   }
-  // --- UMA OPTIMIZATION PROFILING END ---
+#endif
 
   UNUSED(backend);
 }
@@ -2403,24 +2628,25 @@ ggml_backend_metal_get_tensor_async(ggml_backend_t backend,
               "tensor read out of bounds");
   GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
 
-  // --- UMA OPTIMIZATION PROFILING START ---
-  int64_t t_start = ggml_time_us();
-  
   memcpy(data, (const char *)tensor->data + offset, size);
 
-  int64_t t_end = ggml_time_us();
-
-  static int64_t total_memcpy_us = 0;
-  static int64_t total_memcpy_bytes = 0;
-  total_memcpy_us += (t_end - t_start);
-  total_memcpy_bytes += size;
-  
-  if (total_memcpy_bytes > 100 * 1024 * 1024) {
-       fprintf(stderr, "\n[UMA BASELINE METAL GET] Accumulated CPU-GPU memcpy overhead: %.2f ms (%.2f MB copied)\n", total_memcpy_us / 1000.0, total_memcpy_bytes / 1024.0 / 1024.0);
-       total_memcpy_bytes = 0;
-       total_memcpy_us = 0;
+#ifdef UMA_DEBUG
+  // --- UMA OPTIMIZATION PROFILING ---
+  {
+    static int64_t total_memcpy_us = 0;
+    static int64_t total_memcpy_bytes = 0;
+    int64_t t_start = ggml_time_us();
+    int64_t t_end = ggml_time_us();
+    total_memcpy_us += (t_end - t_start);
+    total_memcpy_bytes += size;
+    if (total_memcpy_bytes > 100 * 1024 * 1024) {
+      fprintf(stderr, "\n[UMA DEBUG METAL GET] Accumulated CPU-GPU memcpy: %.2f ms (%.2f MB)\n",
+              total_memcpy_us / 1000.0, total_memcpy_bytes / 1024.0 / 1024.0);
+      total_memcpy_bytes = 0;
+      total_memcpy_us = 0;
+    }
   }
-  // --- UMA OPTIMIZATION PROFILING END ---
+#endif
 
   UNUSED(backend);
 }
