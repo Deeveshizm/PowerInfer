@@ -2254,36 +2254,11 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
     for (int i = 0; i < n_cb; i++) {
       [ctx->command_buffers[i] waitUntilCompleted];
 
-      // [PERF-DBG] Report actual GPU execution time (env var METAL_GPU_TIME_DBG)
-      // Total GPU compute time per token aggregated across all command buffers.
-      if (getenv("METAL_GPU_TIME_DBG")) {
-        CFTimeInterval gpu_start = [ctx->command_buffers[i] GPUStartTime];
-        CFTimeInterval gpu_end   = [ctx->command_buffers[i] GPUEndTime];
-        if (gpu_end > gpu_start) {
-          double gpu_ms = (gpu_end - gpu_start) * 1000.0;
-          static double tot_axpy_gpu = 0, tot_sparse_gpu = 0;
-          static int axpy_count = 0, sparse_count = 0;
-          if (gf->n_nodes == 1) { tot_axpy_gpu += gpu_ms; axpy_count++; }
-          else                  { tot_sparse_gpu += gpu_ms; sparse_count++; }
-          static int dbg_cb_count = 0;
-          dbg_cb_count++;
-          if (dbg_cb_count == 64) {
-            fprintf(stderr, "[METAL-TOTAL] pre-AXPY: %.2f ms (%d cbs, avg %.2f) | AXPY: %.2f ms (%d cbs, avg %.2f)\n",
-                    tot_sparse_gpu, sparse_count, tot_sparse_gpu / (sparse_count ?: 1),
-                    tot_axpy_gpu, axpy_count, tot_axpy_gpu / (axpy_count ?: 1));
-            tot_axpy_gpu = tot_sparse_gpu = 0;
-            axpy_count = sparse_count = 0;
-            dbg_cb_count = 0;
-          }
-        }
-      }
-
       MTLCommandBufferStatus status =
           (MTLCommandBufferStatus)[ctx->command_buffers[i] status];
       if (status != MTLCommandBufferStatusCompleted) {
         GGML_METAL_LOG_INFO("%s: command buffer %d failed with status %lu\n",
                             __func__, i, status);
-        // [UMA-FIX DEBUG] Print detailed Metal error for debugging
         NSError *error = [ctx->command_buffers[i] error];
         if (error) {
             GGML_METAL_LOG_ERROR("%s: error: %s\n", __func__,
@@ -2302,38 +2277,11 @@ void ggml_metal_graph_compute(struct ggml_metal_context *ctx,
 // [UMA-FIX] Per-layer Metal execution for sparse inference on UMA.
 // Processes only nodes in [node_start, node_end), skipping sparse ops.
 // Reuses ggml_metal_graph_compute by creating a lightweight graph view.
-// Forward decl to call into the CPU-side debug capture hook (defined in ggml.c)
-extern void ggml_op_dbg_capture(struct ggml_tensor * node, int node_n);
-
 void ggml_metal_graph_compute_layer(struct ggml_metal_context *ctx,
                                      struct ggml_cgraph *gf,
                                      int node_start,
                                      int node_end) {
   if (node_start >= node_end) return;
-
-  // [OP_DBG] If OP_DBG is set, run one node at a time and capture the
-  // output tensor values before the next op potentially overwrites memory.
-  // This is slow but gives a reliable op-by-op dump for CPU/GPU comparison.
-  if (getenv("OP_DBG")) {
-    for (int i = node_start; i < node_end; i++) {
-      struct ggml_cgraph one = {
-        .size    = 1,
-        .n_nodes = 1,
-        .n_leafs = 0,
-        .nodes   = gf->nodes + i,
-        .grads   = NULL,
-        .leafs   = NULL,
-        .visited_hash_table = { 0, NULL },
-        .perf_runs   = 0,
-        .perf_cycles = 0,
-        .perf_time_us = 0,
-      };
-      ggml_metal_graph_compute(ctx, &one);
-      // Metal has waited on the command buffer by now; output is valid.
-      ggml_op_dbg_capture(gf->nodes[i], i);
-    }
-    return;
-  }
 
   // Create a stack-local graph that views into the original's node array.
   // This reuses the full op dispatch in ggml_metal_graph_compute without

@@ -14890,126 +14890,6 @@ static void ggml_ensure_tensor_data_at_memory(struct ggml_tensor * tensor) {
 #endif
 }
 
-// [CPU-TIMING] Per-op wall clock timing. Activated by CPU_TIMING=1.
-// Aggregates by op type and prints totals on token boundaries.
-int64_t cpu_timing_total_us[GGML_OP_COUNT] = {0};
-int64_t cpu_timing_count[GGML_OP_COUNT] = {0};
-static int cpu_timing_token = 0;
-
-void cpu_timing_print_and_reset(void) {
-    if (!getenv("CPU_TIMING")) return;
-    int64_t total = 0;
-    for (int i = 0; i < GGML_OP_COUNT; i++) total += cpu_timing_total_us[i];
-    fprintf(stderr, "[CPU-TIMING token %d] total=%lld us", cpu_timing_token, (long long)total);
-    // Print top contributors
-    const struct { const char * name; enum ggml_op op; } watch[] = {
-        {"MUL_MAT", GGML_OP_MUL_MAT},
-        {"MUL_MAT_SPARSE", GGML_OP_MUL_MAT_SPARSE},
-        {"AXPY", GGML_OP_AXPY},
-        {"RMS_NORM", GGML_OP_RMS_NORM},
-        {"MUL", GGML_OP_MUL},
-        {"ADD", GGML_OP_ADD},
-        {"SOFT_MAX", GGML_OP_SOFT_MAX},
-        {"ROPE", GGML_OP_ROPE},
-        {"UNARY", GGML_OP_UNARY},
-    };
-    for (size_t i = 0; i < sizeof(watch)/sizeof(watch[0]); i++) {
-        if (cpu_timing_total_us[watch[i].op] > 0) {
-            fprintf(stderr, " | %s=%lld us (%lld)", watch[i].name,
-                    (long long)cpu_timing_total_us[watch[i].op],
-                    (long long)cpu_timing_count[watch[i].op]);
-        }
-    }
-    fprintf(stderr, "\n");
-    for (int i = 0; i < GGML_OP_COUNT; i++) { cpu_timing_total_us[i] = 0; cpu_timing_count[i] = 0; }
-    cpu_timing_token++;
-}
-
-// [OP_DBG] Per-op output capture hook.
-// Activated by env var OP_DBG=<label>. Appends one line per op to
-// /tmp/op_dbg_<label>.txt: capture_idx<TAB>op_name<TAB>name<TAB>ne0<TAB>ne1<TAB>type<TAB>v0..v7
-// capture_idx ignored - we always use a monotonic counter internally.
-static int g_op_dbg_counter = 0;
-void ggml_op_dbg_capture(struct ggml_tensor * node, int node_n) {
-    (void)node_n;  // ignored - use monotonic counter
-    int counter = g_op_dbg_counter++;
-    const char * label = getenv("OP_DBG");
-    if (!label || !node) return;
-    static FILE * fp = NULL;
-    static char last_label[64] = "";
-    if (!fp || strncmp(last_label, label, sizeof(last_label)) != 0) {
-        if (fp) fclose(fp);
-        char path[256];
-        snprintf(path, sizeof(path), "/tmp/op_dbg_%s.txt", label);
-        fp = fopen(path, "w");
-        strncpy(last_label, label, sizeof(last_label) - 1);
-        if (!fp) return;
-        fprintf(stderr, "[OP_DBG] writing to %s\n", path);
-    }
-    if (!fp) return;
-    if (!node->data) {
-        fprintf(fp, "%d\t%s\t%s\t%lld\t%lld\t%s\tNO_DATA\n",
-                counter, ggml_op_name(node->op), node->name[0] ? node->name : "?",
-                (long long)node->ne[0], (long long)node->ne[1],
-                ggml_type_name(node->type));
-        return;
-    }
-    // Extract first 4 values from batch position 0 and batch position 1 (if exists)
-    // This detects batch collapse bugs.
-    float v0[4] = {0};
-    float v1[4] = {0};
-    const int n = 4;
-    const int64_t ne0 = node->ne[0];
-    const int64_t ne1 = node->ne[1];
-    const size_t nb1 = node->nb[1];
-
-    // Also compute full-vector L2 norm and count of non-zero entries for the node.
-    // This gives a coarse fingerprint usable across CPU/GPU comparison.
-    float l2_b0 = 0.0f, l2_b1 = 0.0f;
-    int   nz_b0 = 0,    nz_b1 = 0;
-    if (node->type == GGML_TYPE_F32) {
-        const float * d = (const float *)node->data;
-        for (int k = 0; k < n && k < ne0; k++) v0[k] = d[k];
-        for (int64_t k = 0; k < ne0; k++) { float x = d[k]; l2_b0 += x*x; if (x != 0.0f) nz_b0++; }
-        if (ne1 >= 2) {
-            const float * d2 = (const float *)((const char *)node->data + nb1);
-            for (int k = 0; k < n && k < ne0; k++) v1[k] = d2[k];
-            for (int64_t k = 0; k < ne0; k++) { float x = d2[k]; l2_b1 += x*x; if (x != 0.0f) nz_b1++; }
-        }
-    } else if (node->type == GGML_TYPE_F16) {
-        const ggml_fp16_t * d = (const ggml_fp16_t *)node->data;
-        for (int k = 0; k < n && k < ne0; k++) v0[k] = GGML_FP16_TO_FP32(d[k]);
-        for (int64_t k = 0; k < ne0; k++) { float x = GGML_FP16_TO_FP32(d[k]); l2_b0 += x*x; if (x != 0.0f) nz_b0++; }
-        if (ne1 >= 2) {
-            const ggml_fp16_t * d2 = (const ggml_fp16_t *)((const char *)node->data + nb1);
-            for (int k = 0; k < n && k < ne0; k++) v1[k] = GGML_FP16_TO_FP32(d2[k]);
-            for (int64_t k = 0; k < ne0; k++) { float x = GGML_FP16_TO_FP32(d2[k]); l2_b1 += x*x; if (x != 0.0f) nz_b1++; }
-        }
-    } else if (node->type == GGML_TYPE_I32) {
-        const int32_t * d = (const int32_t *)node->data;
-        for (int k = 0; k < n && k < ne0; k++) v0[k] = (float)d[k];
-        if (ne1 >= 2) {
-            const int32_t * d2 = (const int32_t *)((const char *)node->data + nb1);
-            for (int k = 0; k < n && k < ne0; k++) v1[k] = (float)d2[k];
-        }
-    } else {
-        fprintf(fp, "%d\t%s\t%s\t%lld\t%lld\t%s\tQUANTIZED\n",
-                counter, ggml_op_name(node->op), node->name[0] ? node->name : "?",
-                (long long)ne0, (long long)ne1, ggml_type_name(node->type));
-        return;
-    }
-    fprintf(fp, "%d\t%s\t%s\t%lld\t%lld\t%s",
-            counter, ggml_op_name(node->op), node->name[0] ? node->name : "?",
-            (long long)ne0, (long long)ne1, ggml_type_name(node->type));
-    // b0_v0 b0_v1 b0_v2 b0_v3 | b1_v0 b1_v1 b1_v2 b1_v3 | l2_b0 nz_b0 l2_b1 nz_b1
-    for (int k = 0; k < 4; k++) fprintf(fp, "\t%.6f", v0[k]);
-    fprintf(fp, "\t|");
-    for (int k = 0; k < 4; k++) fprintf(fp, "\t%.6f", v1[k]);
-    fprintf(fp, "\tL2:\t%.4f\t%d\t%.4f\t%d", l2_b0, nz_b0, l2_b1, nz_b1);
-    fprintf(fp, "\n");
-    fflush(fp);
-}
-
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -17125,25 +17005,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                     params.nth = ggml_get_n_tasks(node, n_threads);
                     ggml_compute_forward(&params, node);
                 }
-                // [CPU-TIMING] Record multi-threaded op completion time.
-                // perf_node_start_time_us is only populated when GGML_PERF is defined.
-                // Guard against 0 to avoid nonsense deltas.
-                if (getenv("CPU_TIMING") && state->ith == 0) {
-                    int64_t _node_end = ggml_time_us();
-                    int64_t _node_start = state->shared->perf_node_start_time_us;
-                    if (_node_start > 0 && _node_end > _node_start) {
-                        cpu_timing_total_us[node->op] += (_node_end - _node_start);
-                        cpu_timing_count[node->op]++;
-                    }
-                }
-                // [OP_DBG] Capture per-op output when OP_DBG env var is set.
-                // This block runs under the n_active==1 branch (single finalizer
-                // thread) so no concurrent captures from other threads.
-                if (state->ith == 0) {
-                    extern void ggml_op_dbg_capture(struct ggml_tensor * node, int node_n);
-                    static int dbg_mono_counter = 0;
-                    ggml_op_dbg_capture(node, dbg_mono_counter++);
-                }
                 ggml_graph_compute_perf_stats_node(node, state->shared);
             }
 
@@ -17168,24 +17029,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 if (n_tasks == 1) {
                     // TODO: maybe push node_n to the atomic but if other threads see n_tasks is 1,
                     // they do something more efficient than spinning (?)
-                    int64_t _t0 = getenv("CPU_TIMING") ? ggml_time_us() : 0;
                     params.type = GGML_TASK_COMPUTE;
                     ggml_compute_forward(&params, node);
 
                     if (GGML_OP_HAS_FINALIZE[node->op]) {
                         params.type = GGML_TASK_FINALIZE;
                         ggml_compute_forward(&params, node);
-                    }
-                    if (getenv("CPU_TIMING") && state->ith == 0) {
-                        cpu_timing_total_us[node->op] += ggml_time_us() - _t0;
-                        cpu_timing_count[node->op]++;
-                    }
-
-                    // [OP_DBG] Capture single-threaded op output
-                    if (state->ith == 0) {
-                        extern void ggml_op_dbg_capture(struct ggml_tensor * node, int node_n);
-                        static int dbg_mono_counter2 = 0;
-                        ggml_op_dbg_capture(node, dbg_mono_counter2++);
                     }
 
                     ggml_graph_compute_perf_stats_node(node, state->shared);
